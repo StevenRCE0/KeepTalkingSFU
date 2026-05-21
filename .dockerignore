@@ -1,0 +1,10 @@
+.build/
+.swiftpm/
+.git/
+.github/
+.gitignore
+Dockerfile
+.dockerignore
+*.xcodeproj/
+*.xcworkspace/
+*.md
