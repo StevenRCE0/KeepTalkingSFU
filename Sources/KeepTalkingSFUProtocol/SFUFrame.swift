@@ -70,6 +70,7 @@ import Foundation
 ///   0x02 actionCall  — usually L2-pairwise (per-relation key AEAD)
 ///   0x03 signaling   — trust handshakes / lures (pairwise)
 ///   0x04 p2pSignal   — SDP/ICE for libjuice direct P2P (pairwise)
+///   0x05 realtime    — live media/control frames
 ///
 /// The SFU treats channel as opaque routing-payload metadata — it never
 /// dispatches differently by channel today. Receivers use it as a hint
@@ -105,6 +106,7 @@ public enum SFUChannel: UInt8, Sendable, CaseIterable {
     case actionCall = 0x02
     case signaling = 0x03
     case p2pSignal = 0x04
+    case realtime = 0x05
 }
 
 public enum SFUFrame {
@@ -374,4 +376,3 @@ public enum SFURelayCloseReason {
     public static let unauthorized: UInt8 = 0x02
     public static let unknownRelay: UInt8 = 0x03
 }
-
