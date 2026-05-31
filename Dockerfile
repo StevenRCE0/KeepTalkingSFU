@@ -15,10 +15,9 @@ RUN swift package resolve
 COPY Sources ./Sources
 COPY Tests ./Tests
 
-RUN BIN_PATH="$(swift build -c release --show-bin-path)" \
-    && swift build -c release --product KeepTalkingSFU -Xswiftc -g \
+RUN swift build -c release --product KeepTalkingSFU -Xswiftc -g \
     && mkdir -p /out \
-    && install "$BIN_PATH/KeepTalkingSFU" /out/KeepTalkingSFU
+    && install .build/release/KeepTalkingSFU /out/KeepTalkingSFU
 
 # --- Runtime stage ------------------------------------------------------------
 FROM swift:6.3-noble-slim AS runtime
