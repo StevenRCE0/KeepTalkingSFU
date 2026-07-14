@@ -75,8 +75,10 @@ public final class SFUClient: @unchecked Sendable {
         case left(context: UUID, pubkey: Data)
     }
 
-    public private(set) var state: State = .idle {
-        didSet { onState?(state) }
+    public var state: State {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stateStorage
     }
 
     // MARK: - Storage
@@ -86,9 +88,13 @@ public final class SFUClient: @unchecked Sendable {
     public let publicKey: Data
     private let log: Logger
     private let stateLock = NSLock()
+    private var stateStorage: State = .idle
+    private var connectionGeneration: UInt64 = 0
 
     /// NIO plumbing. `eventLoopGroup` is owned, shut down on `close()`.
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
+    /// Bootstrap attempt retained so shutdown can close it before its group.
+    private var connectionAttempt: EventLoopFuture<Channel>?
     /// The parent (connection-level) channel.
     private var connectionChannel: Channel?
     /// The per-stream channel created via the HTTP/2 multiplexer.
@@ -119,24 +125,29 @@ public final class SFUClient: @unchecked Sendable {
     }
 
     public func connect() {
-        guard state == .idle || state == .closed else {
-            log.warning("connect() called in state=\(state)")
+        stateLock.lock()
+        let previousState = stateStorage
+        guard previousState == .idle || previousState == .closed else {
+            stateLock.unlock()
+            log.warning("connect() called in state=\(previousState)")
             return
         }
-        state = .connecting
-
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        self.eventLoopGroup = group
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
+        stateStorage = .connecting
+        stateLock.unlock()
+        onState?(.connecting)
 
         let tlsConfig = makeClientTLSConfig()
         let sslContext: NIOSSLContext
         do {
             sslContext = try NIOSSLContext(configuration: tlsConfig)
         } catch {
-            state = .failed("tls config: \(error)")
+            markFailed("tls config: \(error)", generation: generation)
             return
         }
 
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let host = configuration.host
         let port = configuration.port
         let alpn = configuration.alpn
@@ -152,7 +163,10 @@ public final class SFUClient: @unchecked Sendable {
                 // Connection-level death observer. Stream-level events
                 // can miss abrupt drops; this catches everything.
                 channel.closeFuture.whenComplete { _ in
-                    weakSelf.value?.handleConnectionLost(reason: "channel closed")
+                    weakSelf.value?.handleConnectionLost(
+                        reason: "channel closed",
+                        generation: generation
+                    )
                 }
                 let sslHandler: NIOSSLClientHandler
                 do {
@@ -187,13 +201,27 @@ public final class SFUClient: @unchecked Sendable {
             }
 
         emit("connecting host=\(host):\(port) alpn=\(alpn)")
-        bootstrap.connect(host: host, port: port).whenComplete { result in
+        stateLock.lock()
+        guard connectionGeneration == generation else {
+            stateLock.unlock()
+            Self.shutdown(group)
+            return
+        }
+        eventLoopGroup = group
+        let attempt = bootstrap.connect(host: host, port: port)
+        connectionAttempt = attempt
+        stateLock.unlock()
+        attempt.whenComplete { result in
             switch result {
             case .success(let channel):
-                weakSelf.value?.handleConnectionReady(channel: channel)
+                weakSelf.value?.handleConnectionReady(
+                    channel: channel,
+                    generation: generation
+                )
             case .failure(let err):
-                weakSelf.value?.transitionTo(
-                    .failed("connect: \(err.localizedDescription)")
+                weakSelf.value?.markFailed(
+                    "connect: \(err.localizedDescription)",
+                    generation: generation
                 )
             }
         }
@@ -201,25 +229,46 @@ public final class SFUClient: @unchecked Sendable {
 
     public func close() {
         stateLock.lock()
+        connectionGeneration &+= 1
         let stream = streamChannel
         let parent = connectionChannel
+        let attempt = connectionAttempt
         let group = eventLoopGroup
         streamChannel = nil
         connectionChannel = nil
+        connectionAttempt = nil
         eventLoopGroup = nil
         pendingFrames.removeAll()
         pendingContextSubscriptions.removeAll()
         didAuth = false
+        stateStorage = .closed
         stateLock.unlock()
 
-        stream?.close(promise: nil)
-        parent?.close(promise: nil)
-        if let group {
-            DispatchQueue.global().async {
-                try? group.syncShutdownGracefully()
-            }
+        guard let group else {
+            onState?(.closed)
+            emit("closed")
+            return
         }
-        state = .closed
+        stream?.close(promise: nil)
+        if let parent {
+            parent.close().whenComplete { _ in
+                Self.shutdown(group)
+            }
+        } else if let attempt {
+            attempt.whenComplete { result in
+                switch result {
+                case .success(let channel):
+                    channel.close().whenComplete { _ in
+                        Self.shutdown(group)
+                    }
+                case .failure:
+                    Self.shutdown(group)
+                }
+            }
+        } else {
+            Self.shutdown(group)
+        }
+        onState?(.closed)
         emit("closed")
     }
 
@@ -338,8 +387,19 @@ public final class SFUClient: @unchecked Sendable {
         return host
     }
 
-    private func handleConnectionReady(channel: Channel) {
+    private func handleConnectionReady(
+        channel: Channel,
+        generation: UInt64
+    ) {
+        stateLock.lock()
+        guard connectionGeneration == generation else {
+            stateLock.unlock()
+            channel.close(promise: nil)
+            return
+        }
+        connectionAttempt = nil
         connectionChannel = channel
+        stateLock.unlock()
         let host = configuration.host
         let weakSelf = WeakBox(self)
 
@@ -352,43 +412,84 @@ public final class SFUClient: @unchecked Sendable {
                 .whenComplete { result in
                     switch result {
                     case .failure(let err):
-                        weakSelf.value?.transitionTo(
-                            .failed("multiplexer lookup: \(err)")
+                        weakSelf.value?.markFailed(
+                            "multiplexer lookup: \(err)",
+                            generation: generation
                         )
                     case .success(let mux):
-                        weakSelf.value?.openClientStream(via: mux, host: host)
+                        weakSelf.value?.openClientStream(
+                            via: mux,
+                            host: host,
+                            generation: generation
+                        )
                     }
                 }
         }
     }
 
-    private func openClientStream(via mux: HTTP2StreamMultiplexer, host: String)
-    {
+    private func openClientStream(
+        via mux: HTTP2StreamMultiplexer,
+        host: String,
+        generation: UInt64
+    ) {
         let weakSelf = WeakBox(self)
         mux.createStreamChannel { streamChannel in
             let handler = SFUClientStreamHandler(
                 onFrame: { [weakSelf] frame in
-                    weakSelf.value?.handle(frame: frame)
+                    weakSelf.value?.handle(
+                        frame: frame,
+                        generation: generation
+                    )
                 },
                 onClose: { [weakSelf] reason in
-                    weakSelf.value?.handleStreamClosed(reason: reason)
+                    weakSelf.value?.handleStreamClosed(
+                        reason: reason,
+                        generation: generation
+                    )
                 }
             )
-            return streamChannel.pipeline.addHandler(handler).map {
-                weakSelf.value?.streamChannel = streamChannel
+            return streamChannel.pipeline.addHandler(handler).flatMap {
+                guard weakSelf.value?.installStream(
+                    streamChannel,
+                    generation: generation
+                ) == true else {
+                    return streamChannel.close()
+                }
                 weakSelf.value?.kickoffStream(
                     streamChannel: streamChannel,
-                    host: host
+                    host: host,
+                    generation: generation
                 )
+                return streamChannel.eventLoop.makeSucceededVoidFuture()
             }
         }.whenFailure { error in
-            weakSelf.value?.transitionTo(
-                .failed("stream open: \(error.localizedDescription)")
+            weakSelf.value?.markFailed(
+                "stream open: \(error.localizedDescription)",
+                generation: generation
             )
         }
     }
 
-    private func kickoffStream(streamChannel: Channel, host: String) {
+    private func installStream(
+        _ streamChannel: Channel,
+        generation: UInt64
+    ) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard connectionGeneration == generation else { return false }
+        self.streamChannel = streamChannel
+        return true
+    }
+
+    private func kickoffStream(
+        streamChannel: Channel,
+        host: String,
+        generation: UInt64
+    ) {
+        guard isCurrent(generation) else {
+            streamChannel.close(promise: nil)
+            return
+        }
         // 1. Send request HEADERS (POST /sfu). After server's response
         // headers arrive, server will start sending SFUFrames via DATA.
         var headers = HPACKHeaders()
@@ -408,13 +509,17 @@ public final class SFUClient: @unchecked Sendable {
         // 2. Wire-compat: emit CLIENT_HELLO as the first DATA frame so
         // backends that key off it (none today) still work. SERVER_HELO
         // arrives on response headers.
-        sendImmediate(SFUFrame.encode(type: .clientHello, body: Data()))
+        writeImmediate(
+            SFUFrame.encode(type: .clientHello, body: Data()),
+            to: streamChannel
+        )
         emit("opened http/2 stream to \(host)")
     }
 
-    private func handleStreamClosed(reason: String) {
+    private func handleStreamClosed(reason: String, generation: UInt64) {
+        guard isCurrent(generation) else { return }
         emit("stream closed: \(reason)")
-        markFailed("stream closed: \(reason)")
+        markFailed("stream closed: \(reason)", generation: generation)
     }
 
     /// Parent (TCP/TLS) channel went away — observed via `closeFuture`.
@@ -422,29 +527,47 @@ public final class SFUClient: @unchecked Sendable {
     /// keepalive-detected silent death). Once this fires the SFU broadcast
     /// route is unavailable and `BroadcastChannel`'s state-machine
     /// triggers reconnect.
-    private func handleConnectionLost(reason: String) {
+    private func handleConnectionLost(
+        reason: String,
+        generation: UInt64
+    ) {
+        guard isCurrent(generation) else { return }
         emit("connection lost: \(reason)")
         // Drop the stream-channel reference so subsequent sends fail
         // fast instead of queuing on a dead pipe.
         stateLock.lock()
+        guard connectionGeneration == generation else {
+            stateLock.unlock()
+            return
+        }
         streamChannel = nil
         didAuth = false
         stateLock.unlock()
-        markFailed("connection lost: \(reason)")
+        markFailed("connection lost: \(reason)", generation: generation)
     }
 
-    private func markFailed(_ reason: String) {
-        switch state {
+    private func markFailed(_ reason: String, generation: UInt64) {
+        let next = State.failed(reason)
+        stateLock.lock()
+        guard connectionGeneration == generation else {
+            stateLock.unlock()
+            return
+        }
+        switch stateStorage {
         case .closed, .failed:
+            stateLock.unlock()
             return
         default:
-            transitionTo(.failed(reason))
+            stateStorage = next
+            stateLock.unlock()
+            onState?(next)
         }
     }
 
     // MARK: - Frame dispatch
 
-    private func handle(frame: SFUFrame.Decoded) {
+    private func handle(frame: SFUFrame.Decoded, generation: UInt64) {
+        guard isCurrent(generation) else { return }
         switch frame.type {
         case .serverHello:
             let nonce = frame.body
@@ -454,20 +577,20 @@ public final class SFUClient: @unchecked Sendable {
                 body.append(publicKey)
                 body.append(sig)
                 sendImmediate(SFUFrame.encode(type: .hello, body: body))
-                transitionTo(.authenticating)
+                transitionTo(.authenticating, generation: generation)
                 emit("sent HELLO (nonce \(nonce.count)B); awaiting READY")
             } catch {
-                transitionTo(.failed("sign failed: \(error)"))
+                markFailed("sign failed: \(error)", generation: generation)
             }
 
         case .ready:
-            transitionTo(.ready)
-            flushQueued()
+            transitionTo(.ready, generation: generation)
+            flushQueued(generation: generation)
             emit("received READY; registration confirmed")
 
         case .error:
             let msg = String(data: frame.body, encoding: .utf8) ?? "?"
-            transitionTo(.failed("server error: \(msg)"))
+            markFailed("server error: \(msg)", generation: generation)
 
         case .clientHello, .hello, .join, .leave, .listPeers:
             // Client-originated; ignore inbound.
@@ -617,6 +740,10 @@ public final class SFUClient: @unchecked Sendable {
         let stream = streamChannel
         stateLock.unlock()
         guard let stream else { return }
+        writeImmediate(data, to: stream)
+    }
+
+    private func writeImmediate(_ data: Data, to stream: Channel) {
         var buffer = stream.allocator.buffer(capacity: data.count)
         buffer.writeBytes(data)
         let frame = HTTP2Frame.FramePayload.data(
@@ -627,8 +754,12 @@ public final class SFUClient: @unchecked Sendable {
         }
     }
 
-    private func flushQueued() {
+    private func flushQueued(generation: UInt64) {
         stateLock.lock()
+        guard connectionGeneration == generation else {
+            stateLock.unlock()
+            return
+        }
         didAuth = true
         let subs = pendingContextSubscriptions
         let frames = pendingFrames
@@ -652,10 +783,27 @@ public final class SFUClient: @unchecked Sendable {
         onLog?(message)
     }
 
-    private func transitionTo(_ next: State) {
-        // Avoid bouncing through .closed → other.
-        if state == .closed && next != .closed { return }
-        state = next
+    private func isCurrent(_ generation: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return connectionGeneration == generation
+    }
+
+    private static func shutdown(_ group: MultiThreadedEventLoopGroup) {
+        DispatchQueue.global().async {
+            try? group.syncShutdownGracefully()
+        }
+    }
+
+    private func transitionTo(_ next: State, generation: UInt64) {
+        stateLock.lock()
+        guard connectionGeneration == generation, stateStorage != .closed else {
+            stateLock.unlock()
+            return
+        }
+        stateStorage = next
+        stateLock.unlock()
+        onState?(next)
     }
 
     private static func uuidBytes(_ uuid: UUID) -> Data {
@@ -696,6 +844,7 @@ final class SFUClientStreamHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias OutboundOut = HTTP2Frame.FramePayload
 
     private var parser = SFUFrame.Parser()
+    private var didNotifyClose = false
     private let onFrame: (SFUFrame.Decoded) -> Void
     private let onClose: (String) -> Void
 
@@ -728,10 +877,10 @@ final class SFUClientStreamHandler: ChannelInboundHandler, @unchecked Sendable {
                 context.close(promise: nil)
             }
         case .rstStream(let code):
-            onClose("rst \(code)")
+            notifyClose("rst \(code)")
             context.close(promise: nil)
         case .goAway(let lastID, let code, _):
-            onClose("goaway last=\(lastID) code=\(code)")
+            notifyClose("goaway last=\(lastID) code=\(code)")
             context.close(promise: nil)
         default:
             break
@@ -739,12 +888,18 @@ final class SFUClientStreamHandler: ChannelInboundHandler, @unchecked Sendable {
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        onClose("inactive")
+        notifyClose("inactive")
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        onClose("error: \(error)")
+        notifyClose("error: \(error)")
         context.close(promise: nil)
+    }
+
+    private func notifyClose(_ reason: String) {
+        guard !didNotifyClose else { return }
+        didNotifyClose = true
+        onClose(reason)
     }
 }
 

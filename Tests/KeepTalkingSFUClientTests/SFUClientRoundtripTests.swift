@@ -8,16 +8,24 @@ import Testing
 
 @Suite("SFU end-to-end")
 struct SFUClientRoundtripTests {
-    @Test("client→server→client unicast over loopback")
+    @Test(
+        "client→server→client unicast over loopback",
+        .enabled(
+            if: ProcessInfo.processInfo.environment[
+                SFUServerTLSIdentity.envPathKey
+            ] != nil
+        )
+    )
     func unicastRoundtrip() async throws {
+        let resolved = try SFUServerTLSIdentity.resolve()
         // 1. Stand up an SFU on a free local port.
         let port = try pickFreePort()
         let identity = SFUHTTP2Server.ServerIdentity(
-            pkcs12Base64: SFULabIdentity.pkcs12Base64,
-            passphrase: SFULabIdentity.passphrase
+            pkcs12Base64: resolved.pkcs12Base64,
+            passphrase: resolved.passphrase
         )
         let server = SFUHTTP2Server(
-            configuration: .init(bindPort: port, identity: identity),
+            configuration: .init(bindPort: Int(port), identity: identity),
             log: Logger(label: "test.sfu.server")
         )
         try server.start()
@@ -25,11 +33,11 @@ struct SFUClientRoundtripTests {
 
         // 2. Two clients with fresh Ed25519 identities.
         let alice = SFUClient(
-            configuration: .init(host: "127.0.0.1", port: port),
+            configuration: .init(host: "127.0.0.1", port: Int(port)),
             log: Logger(label: "test.alice")
         )
         let bob = SFUClient(
-            configuration: .init(host: "127.0.0.1", port: port),
+            configuration: .init(host: "127.0.0.1", port: Int(port)),
             log: Logger(label: "test.bob")
         )
 
@@ -56,12 +64,34 @@ struct SFUClientRoundtripTests {
         alice.route(envelope: payload, to: bobPubkey)
 
         // 4. Wait for delivery.
-        try? await Task.sleep(nanoseconds: 500_000_000)
+        try? await Task.sleep(for: .milliseconds(500))
         let received = bobInbox.get()
         #expect(received == [payload])
 
         alice.close()
         bob.close()
+    }
+
+    @Test("closing a connecting client invalidates stale callbacks")
+    func closeDuringConnect() async throws {
+        let port = try pickFreePort()
+        let client = SFUClient(
+            configuration: .init(host: "127.0.0.1", port: Int(port)),
+            log: Logger(label: "test.lifecycle")
+        )
+        let events = LockedBox<[String]>(value: [])
+        client.onLog = { message in
+            events.mutate { $0.append(message) }
+        }
+
+        client.connect()
+        client.close()
+        try? await Task.sleep(for: .milliseconds(500))
+
+        let captured = events.get()
+        let closedIndex = try #require(captured.firstIndex(of: "closed"))
+        #expect(!captured[closedIndex...].contains { $0.hasPrefix("opened ") })
+        #expect(client.state == .closed)
     }
 
     // MARK: - Helpers
@@ -112,7 +142,7 @@ final class AsyncFlag: @unchecked Sendable {
 
     func wait(timeoutSeconds: Double = 10) async {
         let timeout = Task {
-            try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+            try? await Task.sleep(for: .seconds(timeoutSeconds))
             self.signal()
         }
         await withCheckedContinuation { cont in
