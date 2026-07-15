@@ -98,6 +98,40 @@ struct SFURouterTests {
         #expect(stats.contextCount == 0)
     }
 
+    @Test("late disconnect from replaced session preserves replacement")
+    func staleDisconnectPreservesReplacement() async throws {
+        let router = SFURouter()
+        let peerID = Self.id("alice")
+        let first = SFURouter.PeerHandle(
+            id: peerID,
+            sendFrame: { _ in },
+            closeReason: { _ in }
+        )
+        let replacementInbox = Inbox()
+        let replacement = SFURouter.PeerHandle(
+            id: peerID,
+            sendFrame: { frame in await replacementInbox.append(frame) },
+            closeReason: { _ in }
+        )
+        let contextID = UUID()
+
+        await router.register(peer: first)
+        await router.join(peerID: peerID, context: contextID)
+        await router.register(peer: replacement)
+
+        let staleContexts = await router.unregister(
+            peerID: peerID,
+            sessionID: first.sessionID
+        )
+        #expect(staleContexts == nil)
+        #expect(await router.stats().peerCount == 1)
+        #expect(await router.members(in: contextID) == [peerID])
+
+        let payload = Data("still routed".utf8)
+        try await router.route(frame: payload, to: peerID)
+        #expect(await replacementInbox.snapshot() == [payload])
+    }
+
     // MARK: - Helpers
 
     private func makePeer(id: String, inbox: Inbox) -> SFURouter.PeerHandle {

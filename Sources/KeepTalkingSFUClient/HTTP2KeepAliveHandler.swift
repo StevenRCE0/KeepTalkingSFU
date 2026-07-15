@@ -39,15 +39,19 @@ public final class HTTP2KeepAliveHandler: ChannelInboundHandler, @unchecked Send
     private var nextPingNonce: UInt64 = 1
 
     public init(
-        pingInterval: TimeAmount = .seconds(2),
-        readDeadline: TimeAmount = .seconds(5)
+        pingInterval: TimeAmount = .seconds(15),
+        readDeadline: TimeAmount = .seconds(45)
     ) {
+        precondition(
+            readDeadline.nanoseconds >= pingInterval.nanoseconds * 2,
+            "readDeadline must allow at least two ping intervals"
+        )
         self.pingInterval = pingInterval
         self.readDeadline = readDeadline
     }
 
     public func handlerAdded(context: ChannelHandlerContext) {
-        lastReadAt = .now()
+        lastReadAt = context.eventLoop.now
         let loop = context.eventLoop
         let channel = context.channel
         let handlerSelf = self
@@ -65,7 +69,7 @@ public final class HTTP2KeepAliveHandler: ChannelInboundHandler, @unchecked Send
         // Any inbound byte counts. We don't peek into HTTP/2 frames — even
         // PING ACKs surface here as bytes before NIOHTTP2Handler parses
         // them downstream.
-        lastReadAt = .now()
+        lastReadAt = context.eventLoop.now
         context.fireChannelRead(data)
     }
 
@@ -76,7 +80,7 @@ public final class HTTP2KeepAliveHandler: ChannelInboundHandler, @unchecked Send
     }
 
     private func tick(channel: Channel, loop: EventLoop) {
-        let now = NIODeadline.now()
+        let now = loop.now
         if now - lastReadAt > readDeadline {
             // Read timeout — close the channel. The owning carrier
             // observes `closeFuture` and routes the failure through its

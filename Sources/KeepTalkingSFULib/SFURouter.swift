@@ -22,15 +22,18 @@ public actor SFURouter {
     /// the bytes go out over Network.framework QUIC, NIO, or a test stub.
     public struct PeerHandle: Sendable {
         public let id: PeerID
+        public let sessionID: UUID
         public let sendFrame: @Sendable (Data) async -> Void
         public let closeReason: @Sendable (String) async -> Void
 
         public init(
             id: PeerID,
+            sessionID: UUID = UUID(),
             sendFrame: @Sendable @escaping (Data) async -> Void,
             closeReason: @Sendable @escaping (String) async -> Void
         ) {
             self.id = id
+            self.sessionID = sessionID
             self.sendFrame = sendFrame
             self.closeReason = closeReason
         }
@@ -94,34 +97,46 @@ public actor SFURouter {
     /// the router; context memberships transfer to the new session so
     /// presence stays continuous from the perspective of other peers.
     public func register(peer: PeerHandle) async {
-        if let prior = peers[peer.id] {
+        let prior = peers.updateValue(peer, forKey: peer.id)
+        if let prior, prior.sessionID != peer.sessionID {
             log.info("kicking prior session for peer id=\(peer.id.shortHex)")
-            // Old session goes away; new one takes its slot. We don't
-            // unregister via the full path because that would emit
-            // PEER_LEFT to context members — from their POV the peer
-            // never actually left, just rewired its connection.
+            // Install the replacement before closing the prior stream.
+            // Its delayed channelInactive can then be identified as stale
+            // and cannot unregister this new session.
             await prior.closeReason("superseded by new session")
         }
-        peers[peer.id] = peer
         log.info("peer registered id=\(peer.id.shortHex)")
     }
 
-    public func unregister(peerID: PeerID) async {
-        guard peers[peerID] != nil else { return }
+    /// Removes `peerID` only when the disconnect belongs to the currently
+    /// registered transport session. Returns the contexts that lost the peer,
+    /// or `nil` when a superseded stream reported a late disconnect.
+    @discardableResult
+    public func unregister(peerID: PeerID, sessionID: UUID) async -> [ContextID]? {
+        guard peers[peerID]?.sessionID == sessionID else { return nil }
         peers.removeValue(forKey: peerID)
-        for (cid, members) in contextMembers {
-            if members.contains(peerID) {
-                var next = members
-                next.remove(peerID)
-                if next.isEmpty {
-                    contextMembers.removeValue(forKey: cid)
-                } else {
-                    contextMembers[cid] = next
-                }
+        let contexts = contexts(of: peerID)
+        for cid in contexts {
+            guard var members = contextMembers[cid] else { continue }
+            members.remove(peerID)
+            if members.isEmpty {
+                contextMembers.removeValue(forKey: cid)
+            } else {
+                contextMembers[cid] = members
             }
         }
-        await closeRelaysReferencing(peerID, reason: SFURelayCloseReason.peerDisconnected)
+        await closeRelaysReferencing(
+            peerID,
+            reason: SFURelayCloseReason.peerDisconnected
+        )
         log.info("peer unregistered id=\(peerID.shortHex)")
+        return contexts
+    }
+
+    /// Administrative removal of whichever session is currently registered.
+    public func unregister(peerID: PeerID) async {
+        guard let sessionID = peers[peerID]?.sessionID else { return }
+        await unregister(peerID: peerID, sessionID: sessionID)
     }
 
     // MARK: - Context membership

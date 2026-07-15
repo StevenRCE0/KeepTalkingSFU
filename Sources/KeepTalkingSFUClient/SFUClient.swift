@@ -110,8 +110,8 @@ public final class SFUClient: @unchecked Sendable {
     /// declares the connection dead if no inbound bytes arrive for
     /// `livenessDeadline`, and a connection-level HTTP/2 PING goes out
     /// every `pingInterval` to keep the path warm.
-    public var pingInterval: TimeAmount = .seconds(2)
-    public var livenessDeadline: TimeAmount = .seconds(5)
+    public var pingInterval: TimeAmount = .seconds(15)
+    public var livenessDeadline: TimeAmount = .seconds(45)
 
     public init(
         configuration: Configuration,

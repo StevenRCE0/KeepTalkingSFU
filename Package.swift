@@ -122,6 +122,8 @@ let package = Package(
                 "KeepTalkingSFULib",
                 "KeepTalkingSFUProtocol",
                 .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOEmbedded", package: "swift-nio"),
             ]
         ),
     ]

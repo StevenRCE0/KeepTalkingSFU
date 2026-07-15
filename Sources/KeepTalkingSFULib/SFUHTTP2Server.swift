@@ -179,10 +179,12 @@ final class SFUPeerSessionHandler: ChannelInboundHandler, @unchecked Sendable {
 
     private let router: SFURouter
     private let log: Logger
+    private let sessionID = UUID()
     private var parser = SFUFrame.Parser()
     private var registeredPeerID: Data?
     private var authNonce: Data = SFUPeerSessionHandler.makeNonce()
     private var sentResponseHeaders = false
+    private var authenticationTimeout: Scheduled<Void>?
     private weak var context: ChannelHandlerContext?
     private var loopBoundContext: NIOLoopBound<ChannelHandlerContext>?
 
@@ -193,10 +195,20 @@ final class SFUPeerSessionHandler: ChannelInboundHandler, @unchecked Sendable {
 
     func handlerAdded(context: ChannelHandlerContext) {
         self.context = context
-        self.loopBoundContext = context.loopBound
+        let loopBoundContext = context.loopBound
+        self.loopBoundContext = loopBoundContext
+        authenticationTimeout = context.eventLoop.scheduleTask(
+            in: .seconds(30)
+        ) { [weak self, loopBoundContext] in
+            guard let self, self.registeredPeerID == nil else { return }
+            self.log.warning("closing unauthenticated SFU stream after 30s")
+            loopBoundContext.value.close(promise: nil)
+        }
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
+        authenticationTimeout?.cancel()
+        authenticationTimeout = nil
         self.context = nil
         self.loopBoundContext = nil
     }
@@ -205,8 +217,19 @@ final class SFUPeerSessionHandler: ChannelInboundHandler, @unchecked Sendable {
         guard let id = registeredPeerID else { return }
         let router = self.router
         let log = self.log
+        let sessionID = self.sessionID
         Task {
-            let contexts = await router.contexts(of: id)
+            guard
+                let contexts = await router.unregister(
+                    peerID: id,
+                    sessionID: sessionID
+                )
+            else {
+                log.debug(
+                    "ignored stale disconnect peer=\(id.shortHex) session=\(sessionID.uuidString.lowercased())"
+                )
+                return
+            }
             for cid in contexts {
                 let leftFrame = SFUFrame.encode(
                     type: .peerLeft,
@@ -219,7 +242,6 @@ final class SFUPeerSessionHandler: ChannelInboundHandler, @unchecked Sendable {
                     }
                 }
             }
-            await router.unregister(peerID: id)
             log.debug(
                 "presence: peer=\(id.shortHex) disconnected, notified \(contexts.count) contexts"
             )
@@ -340,6 +362,8 @@ final class SFUPeerSessionHandler: ChannelInboundHandler, @unchecked Sendable {
                 return
             }
             registeredPeerID = identity
+            authenticationTimeout?.cancel()
+            authenticationTimeout = nil
             let registered = identity
 
             // Capture self weakly through a closure-captured send hook so
@@ -354,6 +378,7 @@ final class SFUPeerSessionHandler: ChannelInboundHandler, @unchecked Sendable {
             }
             let handle = SFURouter.PeerHandle(
                 id: registered,
+                sessionID: sessionID,
                 sendFrame: send,
                 closeReason: close
             )
