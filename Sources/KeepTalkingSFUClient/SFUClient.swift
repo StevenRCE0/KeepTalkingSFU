@@ -160,14 +160,14 @@ public final class SFUClient: @unchecked Sendable {
             // surfaces as a closed channel instead of a hung stream.
             .channelOption(ChannelOptions.socketOption(.so_keepalive), value: 1)
             .channelInitializer { channel in
-                // Connection-level death observer. Stream-level events
-                // can miss abrupt drops; this catches everything.
-                channel.closeFuture.whenComplete { _ in
-                    weakSelf.value?.handleConnectionLost(
-                        reason: "channel closed",
-                        generation: generation
-                    )
-                }
+                // NOTE: do *not* observe `closeFuture` here. `connect(host:
+                // port:)` runs Happy Eyeballs, which builds one channel per
+                // candidate address (IPv6 first) and closes the losers. A
+                // watcher installed here fires for a doomed candidate — e.g.
+                // the AAAA target on a host with no IPv6 route — and tears
+                // the client down while the IPv4 candidate is still
+                // connecting. The observer belongs on the winning channel;
+                // see `handleConnectionReady`.
                 let sslHandler: NIOSSLClientHandler
                 do {
                     sslHandler = try NIOSSLClientHandler(
@@ -219,8 +219,12 @@ public final class SFUClient: @unchecked Sendable {
                     generation: generation
                 )
             case .failure(let err):
+                // Reflected, not localized: a Happy Eyeballs failure is a
+                // `NIOConnectionError` whose `localizedDescription` hides the
+                // per-candidate errors. Reflecting it names each address that
+                // was tried and why it failed (e.g. an unreachable AAAA).
                 weakSelf.value?.markFailed(
-                    "connect: \(err.localizedDescription)",
+                    "connect \(host):\(port): \(String(reflecting: err))",
                     generation: generation
                 )
             }
@@ -402,6 +406,17 @@ public final class SFUClient: @unchecked Sendable {
         stateLock.unlock()
         let host = configuration.host
         let weakSelf = WeakBox(self)
+
+        // Connection-level death observer, installed on the channel Happy
+        // Eyeballs actually settled on. Stream-level events can miss abrupt
+        // drops; this catches everything. If the channel is already closed
+        // the callback fires immediately, which is the correct outcome.
+        channel.closeFuture.whenComplete { _ in
+            weakSelf.value?.handleConnectionLost(
+                reason: "channel closed",
+                generation: generation
+            )
+        }
 
         // Open one bidirectional HTTP/2 stream and wire SFUFrame plumbing.
         // We're inside whatever event loop the connect future completed
