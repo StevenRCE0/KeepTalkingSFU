@@ -1,0 +1,29 @@
+[package]
+name = "keeptalking-sfu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+description = "KeepTalking presence service with an embedded iroh relay."
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+iroh = "1.2"
+iroh-relay = { version = "1.2", features = ["server"] }
+n0-future = "0.3"
+rcgen = "0.14"
+rustls = { version = "0.23.33", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "kt-sfu"
+path = "src/bin/kt-sfu.rs"
+
+[[bin]]
+name = "kt-probe"
+path = "src/bin/kt-probe.rs"
