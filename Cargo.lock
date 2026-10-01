@@ -1652,6 +1652,7 @@ dependencies = [
  "n0-future",
  "rcgen",
  "rustls",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",

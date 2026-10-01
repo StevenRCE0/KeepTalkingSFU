@@ -1,62 +1,70 @@
 # KeepTalkingSFU (iroh branch)
 
-A Rust rewrite of the KeepTalking SFU. It does two things:
+A Rust rewrite of the KeepTalking SFU. It does three things:
 
 - **Relay.** It embeds [`iroh-relay`](https://docs.rs/iroh-relay). The relay coordinates hole punching and carries traffic between peers that can't reach each other directly. It only ever sees QUIC ciphertext.
-- **Presence.** A hub iroh endpoint keeps one room per context: who is in it, and each member's latest opaque presence blob.
+- **Hub.** An iroh endpoint keeps one room per **topic**: 32 bytes the clients derive from their context secret, so the hub never learns which context a room is. It relays each member's sealed presence blob and, when a sender chooses hub delivery, fans a published payload or datagram out to the rest of the room so the sender uploads once.
+- **Info.** `GET /kt/hub` tells clients the hub id, so apps only configure the relay's domain.
 
-It carries **no message traffic**. Messages, blobs and voice go peer to peer over iroh connections. Each connection starts on this relay and upgrades to direct in the background when hole punching works.
+Peers choose per message between **mesh** delivery (their own iroh connections, which start on this relay and go direct when hole punching works) and **hub** delivery (one upload, fanned out here). The hub never needs to read a payload.
 
-This branch is an orphan and shares no history with the Swift SFU on `main`. Nothing here is wired into the SDK yet.
+This branch is an orphan and shares no history with the Swift SFU on `main`.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `src/proto.rs` | Presence wire format: frames, codec, limits. The protocol reference is in the module docs. |
-| `src/server.rs` | `Sfu`: embedded relay, hub endpoint, rooms. |
-| `src/client.rs` | Reference presence client plus client endpoint setup. The Swift SDK should mirror this on `iroh-ffi`. |
+| `src/proto.rs` | Hub wire format: frames, datagrams, limits. The protocol reference is in the module docs. |
+| `src/server.rs` | `Sfu`: embedded relay, hub endpoint, rooms, publish and datagram fan-out. |
+| `src/info.rs` | The one-route HTTP listener behind `/kt/hub`. |
+| `src/client.rs` | Reference hub client plus client endpoint setup. The Swift SDK mirrors it on `iroh-ffi`. |
 | `src/tls.rs` | PEM loading (reloaded for cert-manager) and self-signed dev certs. |
 | `src/bin/kt-sfu.rs` | The service. |
-| `src/bin/kt-probe.rs` | Probe: joins a room and forms a full mesh with every other probe in it. |
-| `tests/presence.rs` | End-to-end tests against an in-process server. |
+| `src/bin/kt-probe.rs` | Probe: subscribes to a topic and measures both mesh and hub delivery to every other probe in it. |
+| `tests/hub.rs` | End-to-end tests against an in-process server. |
 
 ## Design rules
 
-- **No DNS or DHT discovery.** Endpoints use iroh's `Minimal` preset and a relay map containing only this server. Peers dial each other with `EndpointAddr { id, relay_url }` and nothing else.
-- **Identity comes from sealed presence, never from the server.** The hub reports membership, but the `EndpointId` a peer dials must come out of the context-sealed presence blob. That way a malicious server can't substitute its own key. `kt-probe` enforces this: it checks that the blob's id matches the server-reported id.
-- **Ephemeral client keys.** Clients bind with a fresh key per session. Only the hub key is persistent (`--hub-key`), because clients pin the hub id.
+- **No DNS or DHT discovery.** Endpoints use iroh's `Minimal` preset and a relay map containing only this server.
+- **Topics, not contexts.** Clients derive the topic from the context secret; the hub groups by those 32 bytes and never sees a context id.
+- **Identity comes from sealed presence, never from the server.** The `EndpointId` a peer dials must come out of the topic-sealed presence blob, so a malicious server can't substitute its own key.
+- **Ephemeral client keys.** Clients bind with a fresh key per session. Only the hub key is persistent (`--hub-key`); clients get its id from `/kt/hub`.
 - **The QUIC connection is the identity.** The hub reads `conn.remote_id()`, which is authenticated by the handshake. There is no hello/challenge exchange.
-- **One connection, many contexts.** A process joins every context over a single hub connection.
+- **One connection, many topics.** A process subscribes to every topic over a single hub connection.
 - **A newer connection owns the slot.** If an endpoint reconnects before its old connection times out, the old connection closing does not evict it.
 - **Slow readers are dropped.** A client whose outbox fills up is disconnected rather than allowed to stall a room.
+- **Only subscribers may announce, publish or send datagrams** to a topic.
 - **No relay access control yet** (`AllowAll`).
 
-## Presence protocol (summary)
+## Hub protocol (summary)
 
-ALPN is `keeptalking/presence/1`. The client opens one bidirectional stream and sends first. Frames are `[u32 BE len][u8 tag][body]`, the same framing as the Swift `SFUFrame`.
+ALPN is `keeptalking/hub/1`. The client opens one bidirectional stream and sends first. Frames are `[u32 BE len][u8 tag][body]`.
 
 | Direction | Tag | Frame | Body |
 |---|---|---|---|
-| C→S | 0x11 | JOIN | ctx(16) |
-| C→S | 0x12 | LEAVE | ctx(16) |
-| C→S | 0x13 | PUBLISH | ctx(16) ‖ blob (≤ 16 KiB) |
-| S→C | 0x14 | SNAPSHOT | ctx(16) ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob) |
-| S→C | 0x15 | JOINED | ctx(16) ‖ id(32) |
-| S→C | 0x16 | LEFT | ctx(16) ‖ id(32) |
-| S→C | 0x17 | PRESENCE | ctx(16) ‖ id(32) ‖ blob |
+| C→S | 0x21 | SUBSCRIBE | topic(32) |
+| C→S | 0x22 | UNSUBSCRIBE | topic(32) |
+| C→S | 0x23 | ANNOUNCE | topic(32) ‖ blob (≤ 16 KiB) |
+| C→S | 0x24 | PUBLISH | topic(32) ‖ payload (≤ 1 MiB) |
+| S→C | 0x31 | SNAPSHOT | topic(32) ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob) |
+| S→C | 0x32 | JOINED | topic(32) ‖ id(32) |
+| S→C | 0x33 | LEFT | topic(32) ‖ id(32) |
+| S→C | 0x34 | PRESENCE | topic(32) ‖ id(32) ‖ blob |
+| S→C | 0x35 | DELIVER | topic(32) ‖ payload |
 | S→C | 0x3F | ERROR | UTF-8 |
 
-- `ctx` is RFC 4122 byte order, the same as Swift's `UUID.uuid`.
-- After a JOIN, the joiner always gets the SNAPSHOT before any other event for that room.
-- A zero-length blob in a snapshot means the member hasn't published yet.
+- After a SUBSCRIBE, the subscriber always gets the SNAPSHOT before any other event for that room.
+- A zero-length blob in a snapshot means the member hasn't announced yet.
+- PUBLISH reaches every *other* subscriber as DELIVER; DELIVER doesn't name the sender (the sealed payload does).
+- QUIC datagrams on the hub connection are `topic(32) ‖ payload`; the hub forwards the same bytes to every other subscriber, best effort.
 
 ## Run it locally
 
 ```bash
 cargo run --bin kt-sfu -- --dev \
   --relay-http-bind 127.0.0.1:18080 --relay-https-bind 127.0.0.1:18443 \
-  --relay-quic-bind 127.0.0.1:17842 --hub-bind 127.0.0.1:19702
+  --relay-quic-bind 127.0.0.1:17842 --hub-bind 127.0.0.1:19702 \
+  --info-bind 127.0.0.1:18090
 ```
 
 `--dev` generates a self-signed certificate. It writes it to `kt-sfu-dev-cert.pem`, and the hub key to `kt-sfu-hub.key`. On startup the server prints a ready-to-paste probe command. Run that command in two or more terminals with the same `--context`:
@@ -66,10 +74,9 @@ cargo run --bin kt-probe -- room --hub <hub id> --relay https://127.0.0.1:18443/
   --qad-port 17842 --relay-ca kt-sfu-dev-cert.pem --context <uuid> --duration 20
 ```
 
-The probe reports:
-- when each peer was learned and connected
-- when the connection switched from the relay to a direct path (`path … selected Ip(…)`)
-- QUIC RTT on the selected path, ping round trips, and datagram echoes
+The probe reports, per peer:
+- **mesh:** when the peer was learned and connected, when the connection switched from the relay to a direct path (`path … selected Ip(…)`), QUIC RTT, ping round trips and datagram echoes
+- **hub:** round trip of a ping published through the hub and answered through the hub, and how many hub-forwarded datagrams arrived
 
 Useful flags:
 - `--relay-only` drops IP transports, so that probe's connections stay on the relay.
@@ -83,12 +90,15 @@ To test across machines, add `--dev-host <lan ip or name>` to the server so the 
 cargo test
 ```
 
-- **Room lifecycle:** snapshot, join, publish, late-joiner snapshot, leave, disconnect, and refusing a publish to a context the client hasn't joined.
+- **Room lifecycle:** snapshot, subscribe, announce, late-subscriber snapshot, unsubscribe, disconnect, and refusing an announce to a topic the client isn't subscribed to.
+- **Publish fan-out:** every other subscriber gets one DELIVER, the sender gets none, other topics stay quiet, and an unsubscribed publish is refused.
+- **Datagram fan-out** to the room's other subscribers.
+- **Info endpoint:** `/kt/hub` names the hub, relay, ALPN and QAD port; other paths are 404.
 - **Slot ownership across a reconnect.**
 - **Relay-only peers communicate through the embedded relay.**
 - **Direct upgrade:** peers dialed with only the relay URL upgrade to a direct path.
 
-## Production notes (not deployed)
+## Production
 
 | Port | Proto | Purpose | Required |
 |---|---|---|---|
@@ -96,16 +106,20 @@ cargo test
 | 80 → 8080 | TCP | captive-portal probe | recommended |
 | 7842 | UDP | QUIC address discovery | recommended (better hole punching) |
 | 9702 | UDP | hub endpoint | optional |
+| 127.0.0.1:18090 | TCP | `/kt/hub` info (proxied at `https://<relay>/kt/hub`) | yes |
 
-- **Relay-only still works.** With only TCP 443 exposed everything still works: the hub is a client of its own relay, so presence rides the relay like everything else.
+- **Relay-only still works.** With only TCP 443 exposed everything still works: the hub is a client of its own relay, so hub traffic rides the relay like everything else.
 - **TLS:** `--tls-cert` / `--tls-key` take cert-manager's PEM files directly, with no PKCS#12 step, and are re-read periodically.
 - **Public addresses:** set `--public-relay-url https://signal.rcex.live`, plus `--public-quic-port` if the load balancer remaps it.
-- **Hub key:** mount `--hub-key` from a Secret. Clients pin the hub id, so the key must survive restarts.
+- **Hub key:** persist `--hub-key`. Clients look the hub id up at `/kt/hub`, but a changing id still drops every hub session on restart.
 - **CI:** this branch has no CI workflow, so it never publishes the `latest` image that Keel rolls out.
+
+## Deployed
+
+Runs on the signal host as the podman quadlet `keeptalking-sfu-iroh.container` (host networking, Caddy in front: `/relay /derp /ping` → the relay, `/kt/hub` → the info listener). The image is built locally (`git archive HEAD | docker build --platform linux/amd64 …`) and loaded with `podman load`; the hub key lives in `/opt/keeptalking-sfu-iroh/hub.key`.
 
 ## Next steps
 
-- Hub fan-out ALPN for large rooms: one upload from the sender, forwarded by the hub to every member. Useful for voice and big contexts. It becomes a routing switch in `ContextTransport`.
-- A Swift client on a vendored `iroh-ffi`, implementing `proto.rs` and `client.rs`.
-- Deploy manifests (mixed TCP/UDP Service) and CI for this branch.
 - Relay access control once there is a credential to check.
+- CI that publishes the image, so deploys stop being a manual `podman load`.
+- Watch relay and hub bandwidth once voice moves over (relayed mesh and hub fan-out both multiply on this box).

@@ -1,79 +1,133 @@
-//! Wire format of the presence protocol (ALPN [`PRESENCE_ALPN`]).
+//! Wire format of the hub protocol (ALPN [`HUB_ALPN`]).
 //!
-//! The client opens exactly one bidirectional QUIC stream on its connection
-//! to the hub and speaks first. Both directions carry length-prefixed,
-//! type-tagged frames, laid out like the Swift SFU's `SFUFrame`:
+//! A client opens exactly one bidirectional QUIC stream on its connection to
+//! the hub and speaks first. Both directions carry length-prefixed,
+//! type-tagged frames:
 //!
 //! ```text
 //! [4-byte BE length = 1 + body] [1-byte type] [body]
 //! ```
 //!
-//! Identity is the QUIC connection's authenticated remote `EndpointId`, so
-//! there is no hello/challenge exchange. One connection may join many
-//! contexts.
+//! Rooms are keyed by a 32-byte **topic**. Clients derive it from their
+//! context secret, so the hub never learns which context a room is; it only
+//! groups subscribers. Identity is the QUIC connection's authenticated
+//! remote `EndpointId`; there is no hello/challenge.
 //!
 //! # Client → server
 //!
-//! | tag  | frame   | body                  |
-//! |------|---------|-----------------------|
-//! | 0x11 | JOIN    | ctx(16)               |
-//! | 0x12 | LEAVE   | ctx(16)               |
-//! | 0x13 | PUBLISH | ctx(16) ‖ blob        |
+//! | tag  | frame       | body                         |
+//! |------|-------------|------------------------------|
+//! | 0x21 | SUBSCRIBE   | topic(32)                    |
+//! | 0x22 | UNSUBSCRIBE | topic(32)                    |
+//! | 0x23 | ANNOUNCE    | topic(32) ‖ blob (≤ 16 KiB)  |
+//! | 0x24 | PUBLISH     | topic(32) ‖ payload (≤ 1 MiB)|
 //!
 //! # Server → client
 //!
 //! | tag  | frame    | body                                                   |
 //! |------|----------|--------------------------------------------------------|
-//! | 0x14 | SNAPSHOT | ctx(16) ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob[len])   |
-//! | 0x15 | JOINED   | ctx(16) ‖ id(32)                                       |
-//! | 0x16 | LEFT     | ctx(16) ‖ id(32)                                       |
-//! | 0x17 | PRESENCE | ctx(16) ‖ id(32) ‖ blob                                |
+//! | 0x31 | SNAPSHOT | topic ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob[len])     |
+//! | 0x32 | JOINED   | topic ‖ id(32)                                         |
+//! | 0x33 | LEFT     | topic ‖ id(32)                                         |
+//! | 0x34 | PRESENCE | topic ‖ id(32) ‖ blob                                  |
+//! | 0x35 | DELIVER  | topic ‖ payload                                        |
 //! | 0x3F | ERROR    | UTF-8 reason                                           |
 //!
-//! `ctx` is the context UUID in RFC 4122 byte order, the same order as
-//! Swift's `UUID.uuid` tuple. `id` is a 32-byte ed25519 `EndpointId`.
-//! `blob` is opaque to the server: clients put their context-sealed presence
-//! envelope there. A zero-length blob in SNAPSHOT means the member has not
-//! published yet.
+//! - ANNOUNCE stores the sender's presence blob (its context-sealed endpoint
+//!   id) and is relayed as PRESENCE; a late subscriber gets every latest blob
+//!   in its SNAPSHOT. A zero-length blob means "not announced yet".
+//! - PUBLISH is reliable fan-out: the hub sends DELIVER with the same payload
+//!   to every *other* subscriber, so a sender uploads once however large the
+//!   room. DELIVER does not name the sender; the sealed payload does.
+//!
+//! # Datagrams
+//!
+//! QUIC datagrams on the hub connection are `topic(32) ‖ payload`. The hub
+//! forwards the identical bytes to every other subscriber, best effort (voice).
+
+use std::fmt;
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use iroh::EndpointId;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use uuid::Uuid;
 
-/// ALPN for the presence protocol spoken with the hub endpoint.
-pub const PRESENCE_ALPN: &[u8] = b"keeptalking/presence/1";
-
-/// Largest frame (type byte + body) either side accepts.
-pub const MAX_FRAME_LEN: usize = 256 * 1024;
-/// Largest presence blob a member may publish.
-pub const MAX_PRESENCE_LEN: usize = 16 * 1024;
+/// ALPN for the hub protocol.
+pub const HUB_ALPN: &[u8] = b"keeptalking/hub/1";
+/// Largest presence blob a client may announce.
+pub const MAX_ANNOUNCE_LEN: usize = 16 * 1024;
+/// Largest payload a client may publish (one sealed envelope).
+pub const MAX_PUBLISH_LEN: usize = 1 << 20;
+/// Largest frame on the wire: a full publish plus headroom.
+pub const MAX_FRAME_LEN: usize = MAX_PUBLISH_LEN + 64 * 1024;
 
 mod tag {
-    pub const JOIN: u8 = 0x11;
-    pub const LEAVE: u8 = 0x12;
-    pub const PUBLISH: u8 = 0x13;
-    pub const SNAPSHOT: u8 = 0x14;
-    pub const JOINED: u8 = 0x15;
-    pub const LEFT: u8 = 0x16;
-    pub const PRESENCE: u8 = 0x17;
+    pub const SUBSCRIBE: u8 = 0x21;
+    pub const UNSUBSCRIBE: u8 = 0x22;
+    pub const ANNOUNCE: u8 = 0x23;
+    pub const PUBLISH: u8 = 0x24;
+    pub const SNAPSHOT: u8 = 0x31;
+    pub const JOINED: u8 = 0x32;
+    pub const LEFT: u8 = 0x33;
+    pub const PRESENCE: u8 = 0x34;
+    pub const DELIVER: u8 = 0x35;
     pub const ERROR: u8 = 0x3F;
+}
+
+/// A room key: 32 opaque bytes the clients derive from their context secret.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Topic(pub [u8; 32]);
+
+impl Topic {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// First 10 hex digits, like `EndpointId::fmt_short`.
+    pub fn fmt_short(&self) -> String {
+        hex(&self.0[..5])
+    }
+
+    pub fn from_hex(s: &str) -> Result<Self> {
+        ensure!(s.len() == 64, "topic must be 64 hex digits");
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).context("topic is not hex")?;
+        }
+        Ok(Self(out))
+    }
+}
+
+impl fmt::Debug for Topic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Topic({})", self.fmt_short())
+    }
+}
+
+impl fmt::Display for Topic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex(&self.0))
+    }
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A frame sent by a client to the hub.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientFrame {
-    Join { context: Uuid },
-    Leave { context: Uuid },
-    Publish { context: Uuid, blob: Bytes },
+    Subscribe { topic: Topic },
+    Unsubscribe { topic: Topic },
+    Announce { topic: Topic, blob: Bytes },
+    Publish { topic: Topic, payload: Bytes },
 }
 
 /// One entry of a [`ServerFrame::Snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     pub id: EndpointId,
-    /// Latest published presence, empty if the member has not published.
+    /// Latest announced presence, empty if the member has not announced.
     pub blob: Bytes,
 }
 
@@ -81,21 +135,25 @@ pub struct Member {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerFrame {
     Snapshot {
-        context: Uuid,
+        topic: Topic,
         members: Vec<Member>,
     },
     Joined {
-        context: Uuid,
+        topic: Topic,
         id: EndpointId,
     },
     Left {
-        context: Uuid,
+        topic: Topic,
         id: EndpointId,
     },
     Presence {
-        context: Uuid,
+        topic: Topic,
         id: EndpointId,
         blob: Bytes,
+    },
+    Deliver {
+        topic: Topic,
+        payload: Bytes,
     },
     Error {
         reason: String,
@@ -106,17 +164,22 @@ impl ClientFrame {
     pub fn encode(&self) -> Bytes {
         let mut body = BytesMut::new();
         let tag = match self {
-            ClientFrame::Join { context } => {
-                body.put_slice(context.as_bytes());
-                tag::JOIN
+            ClientFrame::Subscribe { topic } => {
+                body.put_slice(topic.as_bytes());
+                tag::SUBSCRIBE
             }
-            ClientFrame::Leave { context } => {
-                body.put_slice(context.as_bytes());
-                tag::LEAVE
+            ClientFrame::Unsubscribe { topic } => {
+                body.put_slice(topic.as_bytes());
+                tag::UNSUBSCRIBE
             }
-            ClientFrame::Publish { context, blob } => {
-                body.put_slice(context.as_bytes());
+            ClientFrame::Announce { topic, blob } => {
+                body.put_slice(topic.as_bytes());
                 body.put_slice(blob);
+                tag::ANNOUNCE
+            }
+            ClientFrame::Publish { topic, payload } => {
+                body.put_slice(topic.as_bytes());
+                body.put_slice(payload);
                 tag::PUBLISH
             }
         };
@@ -125,17 +188,21 @@ impl ClientFrame {
 
     pub fn decode(tag: u8, mut body: Bytes) -> Result<Self> {
         let frame = match tag {
-            tag::JOIN => ClientFrame::Join {
-                context: take_uuid(&mut body)?,
+            tag::SUBSCRIBE => ClientFrame::Subscribe {
+                topic: take_topic(&mut body)?,
             },
-            tag::LEAVE => ClientFrame::Leave {
-                context: take_uuid(&mut body)?,
+            tag::UNSUBSCRIBE => ClientFrame::Unsubscribe {
+                topic: take_topic(&mut body)?,
             },
+            tag::ANNOUNCE => {
+                let topic = take_topic(&mut body)?;
+                return Ok(ClientFrame::Announce { topic, blob: body });
+            }
             tag::PUBLISH => {
-                let context = take_uuid(&mut body)?;
+                let topic = take_topic(&mut body)?;
                 return Ok(ClientFrame::Publish {
-                    context,
-                    blob: body,
+                    topic,
+                    payload: body,
                 });
             }
             other => bail!("unknown client frame 0x{other:02x}"),
@@ -152,8 +219,8 @@ impl ServerFrame {
     pub fn encode(&self) -> Bytes {
         let mut body = BytesMut::new();
         let tag = match self {
-            ServerFrame::Snapshot { context, members } => {
-                body.put_slice(context.as_bytes());
+            ServerFrame::Snapshot { topic, members } => {
+                body.put_slice(topic.as_bytes());
                 body.put_u16(u16::try_from(members.len()).unwrap_or(u16::MAX));
                 for member in members.iter().take(usize::from(u16::MAX)) {
                     body.put_slice(member.id.as_bytes());
@@ -162,21 +229,26 @@ impl ServerFrame {
                 }
                 tag::SNAPSHOT
             }
-            ServerFrame::Joined { context, id } => {
-                body.put_slice(context.as_bytes());
+            ServerFrame::Joined { topic, id } => {
+                body.put_slice(topic.as_bytes());
                 body.put_slice(id.as_bytes());
                 tag::JOINED
             }
-            ServerFrame::Left { context, id } => {
-                body.put_slice(context.as_bytes());
+            ServerFrame::Left { topic, id } => {
+                body.put_slice(topic.as_bytes());
                 body.put_slice(id.as_bytes());
                 tag::LEFT
             }
-            ServerFrame::Presence { context, id, blob } => {
-                body.put_slice(context.as_bytes());
+            ServerFrame::Presence { topic, id, blob } => {
+                body.put_slice(topic.as_bytes());
                 body.put_slice(id.as_bytes());
                 body.put_slice(blob);
                 tag::PRESENCE
+            }
+            ServerFrame::Deliver { topic, payload } => {
+                body.put_slice(topic.as_bytes());
+                body.put_slice(payload);
+                tag::DELIVER
             }
             ServerFrame::Error { reason } => {
                 body.put_slice(reason.as_bytes());
@@ -189,7 +261,7 @@ impl ServerFrame {
     pub fn decode(tag: u8, mut body: Bytes) -> Result<Self> {
         let frame = match tag {
             tag::SNAPSHOT => {
-                let context = take_uuid(&mut body)?;
+                let topic = take_topic(&mut body)?;
                 ensure!(body.remaining() >= 2, "truncated snapshot count");
                 let count = body.get_u16();
                 let mut members = Vec::with_capacity(usize::from(count));
@@ -203,23 +275,30 @@ impl ServerFrame {
                         blob: body.split_to(len),
                     });
                 }
-                ServerFrame::Snapshot { context, members }
+                ServerFrame::Snapshot { topic, members }
             }
             tag::JOINED => ServerFrame::Joined {
-                context: take_uuid(&mut body)?,
+                topic: take_topic(&mut body)?,
                 id: take_id(&mut body)?,
             },
             tag::LEFT => ServerFrame::Left {
-                context: take_uuid(&mut body)?,
+                topic: take_topic(&mut body)?,
                 id: take_id(&mut body)?,
             },
             tag::PRESENCE => {
-                let context = take_uuid(&mut body)?;
+                let topic = take_topic(&mut body)?;
                 let id = take_id(&mut body)?;
                 return Ok(ServerFrame::Presence {
-                    context,
+                    topic,
                     id,
                     blob: body,
+                });
+            }
+            tag::DELIVER => {
+                let topic = take_topic(&mut body)?;
+                return Ok(ServerFrame::Deliver {
+                    topic,
+                    payload: body,
                 });
             }
             tag::ERROR => {
@@ -236,6 +315,20 @@ impl ServerFrame {
     }
 }
 
+/// Builds a hub datagram: `topic ‖ payload`.
+pub fn datagram(topic: &Topic, payload: &[u8]) -> Bytes {
+    let mut out = BytesMut::with_capacity(32 + payload.len());
+    out.put_slice(topic.as_bytes());
+    out.put_slice(payload);
+    out.freeze()
+}
+
+/// Splits a hub datagram into its topic and payload.
+pub fn split_datagram(mut datagram: Bytes) -> Option<(Topic, Bytes)> {
+    let topic = take_topic(&mut datagram).ok()?;
+    Some((topic, datagram))
+}
+
 fn frame(tag: u8, body: &[u8]) -> Bytes {
     let mut out = BytesMut::with_capacity(5 + body.len());
     out.put_u32(1 + body.len() as u32);
@@ -244,9 +337,9 @@ fn frame(tag: u8, body: &[u8]) -> Bytes {
     out.freeze()
 }
 
-fn take_uuid(body: &mut Bytes) -> Result<Uuid> {
-    ensure!(body.remaining() >= 16, "truncated context id");
-    Ok(Uuid::from_slice(&body.split_to(16)).expect("16 bytes"))
+fn take_topic(body: &mut Bytes) -> Result<Topic> {
+    ensure!(body.remaining() >= 32, "truncated topic");
+    Ok(Topic(body.split_to(32)[..].try_into().expect("32 bytes")))
 }
 
 fn take_id(body: &mut Bytes) -> Result<EndpointId> {
@@ -303,24 +396,28 @@ mod tests {
 
     #[tokio::test]
     async fn frames_roundtrip() {
-        let context = Uuid::new_v4();
+        let topic = Topic([7; 32]);
         for frame in [
-            ClientFrame::Join { context },
-            ClientFrame::Leave { context },
-            ClientFrame::Publish {
-                context,
+            ClientFrame::Subscribe { topic },
+            ClientFrame::Unsubscribe { topic },
+            ClientFrame::Announce {
+                topic,
                 blob: Bytes::from_static(b"sealed"),
             },
-            ClientFrame::Publish {
-                context,
+            ClientFrame::Announce {
+                topic,
                 blob: Bytes::new(),
+            },
+            ClientFrame::Publish {
+                topic,
+                payload: Bytes::from_static(b"payload"),
             },
         ] {
             assert_eq!(roundtrip_client(frame.clone()).await, frame);
         }
         for frame in [
             ServerFrame::Snapshot {
-                context,
+                topic,
                 members: vec![
                     Member {
                         id: id(1),
@@ -333,15 +430,19 @@ mod tests {
                 ],
             },
             ServerFrame::Snapshot {
-                context,
+                topic,
                 members: vec![],
             },
-            ServerFrame::Joined { context, id: id(3) },
-            ServerFrame::Left { context, id: id(3) },
+            ServerFrame::Joined { topic, id: id(3) },
+            ServerFrame::Left { topic, id: id(3) },
             ServerFrame::Presence {
-                context,
+                topic,
                 id: id(4),
                 blob: Bytes::from_static(b"x"),
+            },
+            ServerFrame::Deliver {
+                topic,
+                payload: Bytes::from_static(b"y"),
             },
             ServerFrame::Error {
                 reason: "nope".into(),
@@ -355,25 +456,23 @@ mod tests {
     async fn clean_eof_is_none_and_garbage_is_rejected() {
         assert!(read_frame(&mut &b""[..]).await.unwrap().is_none());
         assert!(read_frame(&mut &[0u8, 0, 0, 0][..]).await.is_err());
-        assert!(ClientFrame::decode(tag::JOIN, Bytes::from_static(&[0; 15])).is_err());
-        assert!(ClientFrame::decode(tag::JOIN, Bytes::from_static(&[0; 17])).is_err());
+        assert!(ClientFrame::decode(tag::SUBSCRIBE, Bytes::from_static(&[0; 31])).is_err());
+        assert!(ClientFrame::decode(tag::SUBSCRIBE, Bytes::from_static(&[0; 33])).is_err());
         assert!(ServerFrame::decode(0x99, Bytes::new()).is_err());
     }
 
     #[test]
-    fn uuid_bytes_are_rfc_order() {
-        let context = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
-        let encoded = ClientFrame::Join { context }.encode();
-        assert_eq!(
-            &encoded[5..],
-            &hex_bytes("00112233445566778899aabbccddeeff")[..]
-        );
-    }
+    fn subscribe_layout_and_datagrams() {
+        let topic = Topic([0xAB; 32]);
+        let encoded = ClientFrame::Subscribe { topic }.encode();
+        assert_eq!(&encoded[..5], &[0, 0, 0, 33, 0x21]);
+        assert_eq!(&encoded[5..], &[0xAB; 32]);
 
-    fn hex_bytes(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        let dg = datagram(&topic, b"voice");
+        let (back, payload) = split_datagram(dg).unwrap();
+        assert_eq!(back, topic);
+        assert_eq!(&payload[..], b"voice");
+        assert!(split_datagram(Bytes::from_static(&[0; 31])).is_none());
+        assert_eq!(Topic::from_hex(&topic.to_string()).unwrap(), topic);
     }
 }

@@ -1,6 +1,10 @@
-//! `kt-probe`: joins a presence room on a `kt-sfu` and forms a full mesh
-//! with every other probe in it, reporting how each peer connection behaves:
-//! time to connect, relay → direct upgrade, RTT, and datagram delivery.
+//! `kt-probe`: subscribes to a topic on a `kt-sfu` hub and measures both
+//! delivery paths with every other probe in it:
+//!
+//! - **Mesh:** a direct iroh connection per peer — time to connect,
+//!   relay → direct upgrade, RTT, pings and datagram echoes.
+//! - **Hub:** pings published through the hub (every other probe answers
+//!   through the hub) and datagrams fanned out by the hub.
 //!
 //! Run the same command on two or more machines with the same `--context`.
 
@@ -15,7 +19,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use clap::Parser;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl,
@@ -23,25 +27,26 @@ use iroh::{
 };
 use iroh_relay::RelayQuicConfig;
 use keeptalking_sfu::{
-    client::{ClientOptions, PresenceClient, bind_client},
-    proto::ServerFrame,
+    client::{ClientOptions, HubClient, bind_client},
+    proto::{ServerFrame, Topic},
     tls::ca_from_pem_file,
 };
 use n0_future::StreamExt;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const PROBE_ALPN: &[u8] = b"keeptalking/probe/1";
-/// Presence blob a probe publishes. The SDK will publish a context-sealed
-/// envelope here instead; the probe keeps it readable.
+/// Presence blob a probe announces. The SDK announces a context-sealed blob
+/// here instead; the probe keeps it readable.
 const BLOB_MAGIC: &[u8] = b"kt-probe/1:";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "kt-probe",
-    about = "Probe a kt-sfu: presence + full-mesh peer connections"
+    about = "Probe a kt-sfu: hub fan-out + full-mesh peer connections"
 )]
 enum Command {
-    /// Join a context and connect to every other probe in it.
+    /// Subscribe to a topic and connect to every other probe in it.
     Room(RoomArgs),
 }
 
@@ -59,9 +64,13 @@ struct RoomArgs {
     /// PEM root to trust for the relay (the file `kt-sfu --dev` writes).
     #[arg(long)]
     relay_ca: Option<PathBuf>,
-    /// Context to join. A random one is generated and printed if omitted.
+    /// Context to join; the topic is SHA-256("kt-probe/" ‖ context). A random
+    /// one is generated and printed if omitted.
     #[arg(long)]
     context: Option<Uuid>,
+    /// Use this topic (64 hex digits) instead of deriving one from --context.
+    #[arg(long, conflicts_with = "context")]
+    topic: Option<String>,
     /// Keep every connection on the relay (no IP transports).
     #[arg(long)]
     relay_only: bool,
@@ -102,17 +111,25 @@ async fn room(args: RoomArgs) -> Result<()> {
     })
     .await?;
     let me = endpoint.id();
-    let context = args.context.unwrap_or_else(Uuid::new_v4);
+    let topic = match &args.topic {
+        Some(hex) => Topic::from_hex(hex)?,
+        None => {
+            let context = args.context.unwrap_or_else(Uuid::new_v4);
+            println!("context  {context}");
+            Topic(Sha256::digest([b"kt-probe/".as_slice(), context.as_bytes()].concat()).into())
+        }
+    };
     println!("me       {me}");
-    println!("context  {context}");
+    println!("topic    {topic}");
 
-    let hub = EndpointAddr::new(args.hub).with_relay_url(args.relay.clone());
-    let (presence, mut frames) = PresenceClient::connect(&endpoint, hub).await?;
+    let hub_addr = EndpointAddr::new(args.hub).with_relay_url(args.relay.clone());
+    let (hub, mut frames) = HubClient::connect(&endpoint, hub_addr).await?;
+    let hub = Arc::new(hub);
     println!("hub      connected in {:?}", started.elapsed());
-    presence.join(context).await?;
+    hub.subscribe(topic).await?;
     let mut blob = BytesMut::from(BLOB_MAGIC);
     blob.put_slice(me.as_bytes());
-    presence.publish(context, blob.freeze()).await?;
+    hub.announce(topic, blob.freeze()).await?;
 
     let mesh = Arc::new(Mesh {
         endpoint: endpoint.clone(),
@@ -120,10 +137,13 @@ async fn room(args: RoomArgs) -> Result<()> {
         relay: args.relay.clone(),
         interval: Duration::from_secs_f64(args.interval),
         log_paths: args.paths,
+        started,
         peers: Mutex::new(HashMap::new()),
     });
     tokio::spawn(accept_loop(mesh.clone()));
     tokio::spawn(status_loop(mesh.clone()));
+    tokio::spawn(hub_ping_loop(mesh.clone(), hub.clone(), topic));
+    tokio::spawn(hub_datagram_reader(mesh.clone(), hub.clone()));
 
     let deadline = async {
         if args.duration > 0.0 {
@@ -137,23 +157,23 @@ async fn room(args: RoomArgs) -> Result<()> {
         tokio::select! {
             frame = frames.recv() => {
                 let Some(frame) = frame else {
-                    println!("hub      presence connection closed");
+                    println!("hub      connection closed");
                     break;
                 };
-                handle_frame(&mesh, frame);
+                handle_frame(&mesh, &hub, topic, frame).await;
             }
             _ = tokio::signal::ctrl_c() => break,
             _ = &mut deadline => break,
         }
     }
 
-    presence.close();
+    hub.close();
     endpoint.close().await;
     mesh.print_summary();
     Ok(())
 }
 
-fn handle_frame(mesh: &Arc<Mesh>, frame: ServerFrame) {
+async fn handle_frame(mesh: &Arc<Mesh>, hub: &HubClient, topic: Topic, frame: ServerFrame) {
     match frame {
         ServerFrame::Snapshot { members, .. } => {
             println!("room     snapshot: {} other member(s)", members.len());
@@ -167,6 +187,7 @@ fn handle_frame(mesh: &Arc<Mesh>, frame: ServerFrame) {
             println!("room     - {}", id.fmt_short());
             mesh.forget(id);
         }
+        ServerFrame::Deliver { payload, .. } => mesh.hub_message(hub, topic, payload).await,
         ServerFrame::Error { reason } => println!("hub      error: {reason}"),
     }
 }
@@ -177,6 +198,7 @@ struct Mesh {
     relay: RelayUrl,
     interval: Duration,
     log_paths: bool,
+    started: Instant,
     /// Every peer ever seen; entries stay after a peer leaves so the
     /// summary covers them.
     peers: Mutex<HashMap<EndpointId, Arc<PeerStats>>>,
@@ -196,6 +218,11 @@ struct PeerStats {
     pings_ok: AtomicU64,
     dgrams_sent: AtomicU64,
     dgrams_echoed: AtomicU64,
+    /// Round trip of our latest hub ping, answered by this peer via the hub.
+    hub_rtt: Mutex<Option<Duration>>,
+    hub_pongs: AtomicU64,
+    /// Hub-forwarded datagrams received from this peer.
+    hub_dgrams: AtomicU64,
 }
 
 impl Mesh {
@@ -219,14 +246,17 @@ impl Mesh {
             );
             return;
         }
+        // Hub traffic can create a peer's entry before its presence arrives,
+        // so "learned" is the presence timestamp, not the entry.
         let stats = {
             let mut peers = self.peers.lock().unwrap();
-            if peers.contains_key(&id) {
+            let stats = peers.entry(id).or_default().clone();
+            let mut learned = stats.learned_at.lock().unwrap();
+            if learned.is_some() {
                 return;
             }
-            let stats = Arc::new(PeerStats::default());
-            *stats.learned_at.lock().unwrap() = Some(Instant::now());
-            peers.insert(id, stats.clone());
+            *learned = Some(Instant::now());
+            drop(learned);
             stats
         };
         println!("peer     {} learned", id.fmt_short());
@@ -240,6 +270,48 @@ impl Mesh {
                 }
             });
         }
+    }
+
+    /// A payload the hub fanned out to us: a ping to answer or a pong to
+    /// time. `P ‖ from ‖ seq ‖ t_ns` / `Q ‖ to ‖ from ‖ seq ‖ t_ns`.
+    async fn hub_message(&self, hub: &HubClient, topic: Topic, mut payload: Bytes) {
+        if payload.remaining() < 1 {
+            return;
+        }
+        match payload.get_u8() {
+            b'P' if payload.remaining() >= 48 => {
+                let from = payload.split_to(32);
+                let mut pong = BytesMut::with_capacity(81);
+                pong.put_u8(b'Q');
+                pong.put_slice(&from);
+                pong.put_slice(self.me.as_bytes());
+                pong.put_slice(&payload);
+                let _ = hub.publish(topic, pong.freeze()).await;
+            }
+            b'Q' if payload.remaining() >= 80 => {
+                let to = payload.split_to(32);
+                if to[..] != self.me.as_bytes()[..] {
+                    return;
+                }
+                let from: [u8; 32] = payload.split_to(32)[..].try_into().expect("32 bytes");
+                let Ok(from) = EndpointId::from_bytes(&from) else {
+                    return;
+                };
+                let _seq = payload.get_u64();
+                let sent_ns = payload.get_u64();
+                let rtt = self
+                    .since_start()
+                    .saturating_sub(Duration::from_nanos(sent_ns));
+                let stats = self.peers.lock().unwrap().entry(from).or_default().clone();
+                *stats.hub_rtt.lock().unwrap() = Some(rtt);
+                stats.hub_pongs.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn since_start(&self) -> Duration {
+        self.started.elapsed()
     }
 
     fn forget(&self, id: EndpointId) {
@@ -296,6 +368,44 @@ impl Mesh {
                 stats.traffic(),
             );
         }
+    }
+}
+
+/// Every tick: one ping published through the hub (all other probes answer
+/// through the hub) and one datagram the hub fans out.
+async fn hub_ping_loop(mesh: Arc<Mesh>, hub: Arc<HubClient>, topic: Topic) {
+    let mut tick = tokio::time::interval(mesh.interval);
+    let mut seq = 0u64;
+    loop {
+        tick.tick().await;
+        seq += 1;
+        let sent_ns = mesh.since_start().as_nanos() as u64;
+        let mut ping = BytesMut::with_capacity(49);
+        ping.put_u8(b'P');
+        ping.put_slice(mesh.me.as_bytes());
+        ping.put_u64(seq);
+        ping.put_u64(sent_ns);
+        if hub.publish(topic, ping.freeze()).await.is_err() {
+            return;
+        }
+        let mut dg = BytesMut::with_capacity(40);
+        dg.put_slice(mesh.me.as_bytes());
+        dg.put_u64(seq);
+        let _ = hub.send_datagram(&topic, &dg);
+    }
+}
+
+async fn hub_datagram_reader(mesh: Arc<Mesh>, hub: Arc<HubClient>) {
+    while let Ok((_, payload)) = hub.read_datagram().await {
+        if payload.len() < 32 {
+            continue;
+        }
+        let from: [u8; 32] = payload[..32].try_into().expect("32 bytes");
+        let Ok(from) = EndpointId::from_bytes(&from) else {
+            continue;
+        };
+        let stats = mesh.peers.lock().unwrap().entry(from).or_default().clone();
+        stats.hub_dgrams.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -456,11 +566,17 @@ async fn echo_loop(conn: &Connection) -> Result<()> {
 
 impl PeerStats {
     fn traffic(&self) -> String {
+        let hub = format!(
+            "hub rtt {} x{} dgrams {}",
+            fmt_opt(*self.hub_rtt.lock().unwrap()),
+            self.hub_pongs.load(Ordering::Relaxed),
+            self.hub_dgrams.load(Ordering::Relaxed),
+        );
         if !self.initiator.load(Ordering::Relaxed) {
-            return "echoing".into();
+            return format!("echoing  {hub}");
         }
         format!(
-            "ping {} x{}  dgrams {}/{}",
+            "ping {} x{}  dgrams {}/{}  {hub}",
             fmt_opt(*self.last_ping.lock().unwrap()),
             self.pings_ok.load(Ordering::Relaxed),
             self.dgrams_echoed.load(Ordering::Relaxed),

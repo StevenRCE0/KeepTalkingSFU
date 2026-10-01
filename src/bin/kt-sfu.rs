@@ -1,11 +1,13 @@
-//! `kt-sfu`: KeepTalking presence service with an embedded iroh relay.
+//! `kt-sfu`: KeepTalking hub (presence + topic fan-out) with an embedded iroh
+//! relay.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::atomic::Ordering, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use iroh::{RelayUrl, SecretKey};
 use keeptalking_sfu::{
+    info,
     server::{Sfu, SfuConfig},
     tls::{DevCert, reloading_cert},
 };
@@ -14,7 +16,7 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(
     name = "kt-sfu",
-    about = "KeepTalking presence rooms + embedded iroh relay"
+    about = "KeepTalking hub (topic rooms + fan-out) + embedded iroh relay"
 )]
 struct Args {
     /// Plain-HTTP listener for captive-portal probes.
@@ -77,6 +79,11 @@ struct Args {
     /// hub id must stay stable because clients pin it.
     #[arg(long, env = "KT_SFU_HUB_KEY", default_value = "kt-sfu-hub.key")]
     hub_key: PathBuf,
+
+    /// Plain-HTTP listener for `GET /kt/hub` (hub id, relay, ALPN, QAD port).
+    /// Put it behind the TLS proxy at the relay's domain.
+    #[arg(long, env = "KT_SFU_INFO_BIND")]
+    info_bind: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -138,6 +145,49 @@ async fn main() -> Result<()> {
         sfu.hub_id(),
         sfu.relay_url()
     );
+
+    if let Some(bind) = args.info_bind {
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("info listener {bind}"))?;
+        let body = info::hub_info_json(
+            &sfu.hub_id().to_string(),
+            sfu.relay_url().as_str(),
+            args.public_quic_port
+                .or(sfu.relay_quic_addr().map(|addr| addr.port())),
+        );
+        println!("info       http://{bind}/kt/hub");
+        tokio::spawn(async move {
+            if let Err(err) = info::serve(listener, body).await {
+                tracing::error!("info listener stopped: {err:#}");
+            }
+        });
+    }
+
+    let stats_sfu = sfu.stats_handle();
+    tokio::spawn(async move {
+        let mut last = (0, 0, 0, 0);
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let now = (
+                stats_sfu.published.load(Ordering::Relaxed),
+                stats_sfu.delivered.load(Ordering::Relaxed),
+                stats_sfu.datagrams_in.load(Ordering::Relaxed),
+                stats_sfu.datagrams_out.load(Ordering::Relaxed),
+            );
+            if now != last {
+                info!(
+                    published = now.0,
+                    delivered = now.1,
+                    datagrams_in = now.2,
+                    datagrams_out = now.3,
+                    "hub totals"
+                );
+                last = now;
+            }
+        }
+    });
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("shutting down"),

@@ -1,5 +1,6 @@
-//! Reference client for the presence protocol, used by `kt-probe` and the
-//! tests. The Swift SDK should implement the same thing on `iroh-ffi`.
+//! Reference client for the hub protocol, used by `kt-probe` and the tests.
+//! The Swift SDK implements the same thing on `iroh-ffi`
+//! (`Transport/Iroh/KeepTalkingIrohTransportHost.swift`).
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -9,9 +10,10 @@ use iroh::{
     tls::CaTlsConfig,
 };
 use tokio::sync::{Mutex, mpsc};
-use uuid::Uuid;
 
-use crate::proto::{ClientFrame, PRESENCE_ALPN, ServerFrame, read_frame, write_frame};
+use crate::proto::{
+    ClientFrame, HUB_ALPN, ServerFrame, Topic, datagram, read_frame, split_datagram, write_frame,
+};
 
 /// How a client endpoint is configured: our relay only, no DNS/DHT address
 /// lookup, and an ephemeral key unless one is supplied.
@@ -43,13 +45,14 @@ pub async fn bind_client(options: ClientOptions) -> Result<Endpoint> {
         .map_err(|err| anyhow!("bind endpoint: {err:?}"))
 }
 
-/// A presence session with the hub over one QUIC connection.
-pub struct PresenceClient {
+/// A session with the hub over one QUIC connection: subscriptions,
+/// presence, hub-delivered publishes and datagrams.
+pub struct HubClient {
     conn: Connection,
     send: Mutex<SendStream>,
 }
 
-impl PresenceClient {
+impl HubClient {
     /// Connects and returns the client plus the stream of server frames.
     /// The receiver closes when the connection ends.
     pub async fn connect(
@@ -57,10 +60,10 @@ impl PresenceClient {
         hub: EndpointAddr,
     ) -> Result<(Self, mpsc::Receiver<ServerFrame>)> {
         let conn = endpoint
-            .connect(hub, PRESENCE_ALPN)
+            .connect(hub, HUB_ALPN)
             .await
             .map_err(|err| anyhow!("connect to hub: {err:?}"))?;
-        let (send, mut recv) = conn.open_bi().await.context("open presence stream")?;
+        let (send, mut recv) = conn.open_bi().await.context("open hub stream")?;
         let (tx, rx) = mpsc::channel(256);
         tokio::spawn(async move {
             while let Ok(Some((tag, body))) = read_frame(&mut recv).await {
@@ -83,16 +86,38 @@ impl PresenceClient {
         ))
     }
 
-    pub async fn join(&self, context: Uuid) -> Result<()> {
-        self.send(ClientFrame::Join { context }).await
+    pub async fn subscribe(&self, topic: Topic) -> Result<()> {
+        self.send(ClientFrame::Subscribe { topic }).await
     }
 
-    pub async fn leave(&self, context: Uuid) -> Result<()> {
-        self.send(ClientFrame::Leave { context }).await
+    pub async fn unsubscribe(&self, topic: Topic) -> Result<()> {
+        self.send(ClientFrame::Unsubscribe { topic }).await
     }
 
-    pub async fn publish(&self, context: Uuid, blob: Bytes) -> Result<()> {
-        self.send(ClientFrame::Publish { context, blob }).await
+    pub async fn announce(&self, topic: Topic, blob: Bytes) -> Result<()> {
+        self.send(ClientFrame::Announce { topic, blob }).await
+    }
+
+    /// Reliable fan-out to every other subscriber of `topic`.
+    pub async fn publish(&self, topic: Topic, payload: Bytes) -> Result<()> {
+        self.send(ClientFrame::Publish { topic, payload }).await
+    }
+
+    /// Best-effort fan-out of one datagram to every other subscriber.
+    pub fn send_datagram(&self, topic: &Topic, payload: &[u8]) -> Result<()> {
+        self.conn
+            .send_datagram(datagram(topic, payload))
+            .map_err(|err| anyhow!("hub datagram: {err:?}"))
+    }
+
+    /// Next datagram forwarded by the hub.
+    pub async fn read_datagram(&self) -> Result<(Topic, Bytes)> {
+        loop {
+            let raw = self.conn.read_datagram().await?;
+            if let Some(split) = split_datagram(raw) {
+                return Ok(split);
+            }
+        }
     }
 
     pub fn connection(&self) -> &Connection {
@@ -106,7 +131,7 @@ impl PresenceClient {
     async fn send(&self, frame: ClientFrame) -> Result<()> {
         let mut send = self.send.lock().await;
         if self.conn.close_reason().is_some() {
-            bail!("presence connection closed");
+            bail!("hub connection closed");
         }
         write_frame(&mut *send, &frame.encode()).await
     }
