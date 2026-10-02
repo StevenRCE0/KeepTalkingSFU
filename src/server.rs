@@ -5,7 +5,7 @@
 //! connections, relayed through the embedded relay until they go direct.
 
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -28,14 +28,34 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, info, warn};
 
 use crate::proto::{
-    ClientFrame, MAX_ANNOUNCE_LEN, MAX_PUBLISH_LEN, Member, SFU_ALPN, ServerFrame, Topic,
-    read_frame, split_datagram, write_frame,
+    ClientFrame, FrameLengthError, MAX_ANNOUNCE_LEN, MAX_MEMBERS_PER_TOPIC, MAX_PUBLISH_LEN,
+    MAX_TOPICS_PER_CONNECTION, Member, SFU_ALPN, SNAPSHOT_CHUNK_BYTES, SNAPSHOT_CHUNK_ENTRIES,
+    ServerFrame, Topic, close, encode_snapshot, read_frame, reason, split_datagram, write_frame,
 };
 
-/// Topics one connection may subscribe to at once.
-pub const MAX_TOPICS_PER_CONNECTION: usize = 512;
 /// Frames queued towards one client before it is dropped as too slow.
 const OUTBOX_CAPACITY: usize = 1024;
+
+/// Per-room and per-connection bounds. The defaults are the protocol's;
+/// tests lower them.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub max_members_per_topic: usize,
+    pub max_topics_per_connection: usize,
+    pub snapshot_chunk_entries: usize,
+    pub snapshot_chunk_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_members_per_topic: MAX_MEMBERS_PER_TOPIC,
+            max_topics_per_connection: MAX_TOPICS_PER_CONNECTION,
+            snapshot_chunk_entries: SNAPSHOT_CHUNK_ENTRIES,
+            snapshot_chunk_bytes: SNAPSHOT_CHUNK_BYTES,
+        }
+    }
+}
 
 pub struct SfuConfig {
     /// Plain-HTTP listener (captive-portal probes; everything when TLS is off).
@@ -55,6 +75,7 @@ pub struct SfuConfig {
     pub sfu_secret: SecretKey,
     /// Trust anchors the SFU uses to reach its own relay. `None` = web PKI.
     pub sfu_ca: Option<CaTlsConfig>,
+    pub limits: Limits,
 }
 
 pub struct Sfu {
@@ -74,6 +95,8 @@ pub struct Stats {
     pub delivered: AtomicU64,
     pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
+    /// Client frames skipped for an unknown tag or a malformed body.
+    pub malformed: AtomicU64,
 }
 
 impl Sfu {
@@ -118,7 +141,7 @@ impl Sfu {
             .await
             .map_err(|err| anyhow!("sfu endpoint: {err:?}"))?;
 
-        let rooms = Arc::new(Rooms::default());
+        let rooms = Arc::new(Rooms::new(config.limits));
         let stats = Arc::new(Stats::default());
         let accept_task = tokio::spawn(accept_loop(endpoint.clone(), rooms.clone(), stats.clone()));
         info!(sfu = %endpoint.id(), relay = %relay_url, "sfu up");
@@ -250,6 +273,12 @@ async fn serve_connection(conn: Connection, rooms: &Arc<Rooms>, stats: &Arc<Stat
         rooms.leave(topic, &handle);
     }
     drop(handle);
+    if let Err(err) = &result
+        && let Some(bad) = err.downcast_ref::<FrameLengthError>()
+    {
+        // The stream cannot be resynchronised after a bad length prefix.
+        conn.close(close::PROTOCOL.into(), bad.to_string().as_bytes());
+    }
     let _ = writer.await;
     result
 }
@@ -265,18 +294,26 @@ async fn read_loop(
         let frame = match ClientFrame::decode(tag, body) {
             Ok(frame) => frame,
             Err(err) => {
-                handle.error(format!("{err:#}"));
+                // Skip it; the stream is still in sync.
+                stats.malformed.fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %handle.peer.fmt_short(), "skipping client frame 0x{tag:02x}: {err:#}");
+                handle.error(None, format!("malformed frame 0x{tag:02x}: {err:#}"));
                 continue;
             }
         };
         match frame {
             ClientFrame::Subscribe { topic } => {
-                if !subscribed.contains(&topic) && subscribed.len() >= MAX_TOPICS_PER_CONNECTION {
-                    handle.error(format!("too many topics (max {MAX_TOPICS_PER_CONNECTION})"));
-                    continue;
+                if subscribed.contains(&topic) {
+                    // Already subscribed: no second snapshot.
+                } else if topic.is_zero() {
+                    handle.error(Some(topic), reason::RESERVED_TOPIC.into());
+                } else if subscribed.len() >= rooms.limits.max_topics_per_connection {
+                    handle.error(Some(topic), reason::TOO_MANY_TOPICS.into());
+                } else if rooms.join(topic, handle) {
+                    subscribed.insert(topic);
+                } else {
+                    handle.error(Some(topic), reason::ROOM_FULL.into());
                 }
-                subscribed.insert(topic);
-                rooms.join(topic, handle);
             }
             ClientFrame::Unsubscribe { topic } => {
                 if subscribed.remove(&topic) {
@@ -285,24 +322,18 @@ async fn read_loop(
             }
             ClientFrame::Announce { topic, blob } => {
                 if blob.len() > MAX_ANNOUNCE_LEN {
-                    handle.error(format!("announce too large (max {MAX_ANNOUNCE_LEN} bytes)"));
+                    handle.error(Some(topic), reason::ANNOUNCE_TOO_LARGE.into());
                 } else if !subscribed.contains(&topic) {
-                    handle.error(format!(
-                        "announce to unsubscribed topic {}",
-                        topic.fmt_short()
-                    ));
+                    handle.error(Some(topic), reason::NOT_SUBSCRIBED.into());
                 } else {
                     rooms.announce(topic, handle, blob);
                 }
             }
             ClientFrame::Publish { topic, payload } => {
                 if payload.len() > MAX_PUBLISH_LEN {
-                    handle.error(format!("publish too large (max {MAX_PUBLISH_LEN} bytes)"));
+                    handle.error(Some(topic), reason::PUBLISH_TOO_LARGE.into());
                 } else if !subscribed.contains(&topic) {
-                    handle.error(format!(
-                        "publish to unsubscribed topic {}",
-                        topic.fmt_short()
-                    ));
+                    handle.error(Some(topic), reason::NOT_SUBSCRIBED.into());
                 } else {
                     let fanout = rooms.publish(topic, handle, payload);
                     stats.published.fetch_add(1, Ordering::Relaxed);
@@ -354,8 +385,8 @@ impl MemberHandle {
         }
     }
 
-    fn error(&self, reason: String) {
-        self.deliver(ServerFrame::Error { reason }.encode());
+    fn error(&self, topic: Option<Topic>, reason: String) {
+        self.deliver(ServerFrame::Error { topic, reason }.encode());
     }
 }
 
@@ -369,35 +400,39 @@ type Room = HashMap<EndpointId, Slot>;
 /// Rooms keyed by topic, members keyed by endpoint id. Every mutation and
 /// the frames it causes happen under one lock, so each client sees a room's
 /// events in a consistent order (snapshot first).
-#[derive(Default)]
 struct Rooms {
     inner: Mutex<HashMap<Topic, Room>>,
+    limits: Limits,
 }
 
 impl Rooms {
-    fn join(&self, topic: Topic, handle: &MemberHandle) {
+    fn new(mut limits: Limits) -> Self {
+        limits.max_members_per_topic = limits.max_members_per_topic.max(1);
+        Self {
+            inner: Mutex::default(),
+            limits,
+        }
+    }
+
+    /// Adds the connection to the room and sends it the snapshot. Returns
+    /// false, changing nothing, if the room is full.
+    fn join(&self, topic: Topic, handle: &MemberHandle) -> bool {
         let mut rooms = self.inner.lock().expect("rooms lock");
         let room = rooms.entry(topic).or_default();
-        let announce = match room.entry(handle.peer) {
-            // Same connection subscribing twice: just resend the snapshot.
-            Entry::Occupied(slot) if slot.get().handle.conn_id == handle.conn_id => false,
-            // A newer connection from the same endpoint takes the slot over.
-            Entry::Occupied(mut slot) => {
-                slot.insert(Slot {
-                    handle: handle.clone(),
-                    blob: Bytes::new(),
-                });
-                true
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(Slot {
-                    handle: handle.clone(),
-                    blob: Bytes::new(),
-                });
-                true
-            }
-        };
-        let members = room
+        // A newer connection from the same endpoint takes its slot over;
+        // that does not grow the room. (A new room is never full: the limit
+        // is at least 1.)
+        if !room.contains_key(&handle.peer) && room.len() >= self.limits.max_members_per_topic {
+            return false;
+        }
+        room.insert(
+            handle.peer,
+            Slot {
+                handle: handle.clone(),
+                blob: Bytes::new(),
+            },
+        );
+        let members: Vec<Member> = room
             .iter()
             .filter(|(id, _)| **id != handle.peer)
             .map(|(id, slot)| Member {
@@ -405,18 +440,24 @@ impl Rooms {
                 blob: slot.blob.clone(),
             })
             .collect();
-        handle.deliver(ServerFrame::Snapshot { topic, members }.encode());
-        if announce {
-            broadcast(
-                room,
-                handle.peer,
-                &ServerFrame::Joined {
-                    topic,
-                    id: handle.peer,
-                },
-            );
-            info!(topic = %topic.fmt_short(), peer = %handle.peer.fmt_short(), size = room.len(), "joined");
+        for chunk in encode_snapshot(
+            topic,
+            &members,
+            self.limits.snapshot_chunk_entries,
+            self.limits.snapshot_chunk_bytes,
+        ) {
+            handle.deliver(chunk);
         }
+        broadcast(
+            room,
+            handle.peer,
+            &ServerFrame::Joined {
+                topic,
+                id: handle.peer,
+            },
+        );
+        info!(topic = %topic.fmt_short(), peer = %handle.peer.fmt_short(), size = room.len(), "joined");
+        true
     }
 
     fn leave(&self, topic: Topic, handle: &MemberHandle) {

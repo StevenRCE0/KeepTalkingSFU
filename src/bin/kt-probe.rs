@@ -188,7 +188,10 @@ async fn handle_frame(mesh: &Arc<Mesh>, sfu: &SfuClient, topic: Topic, frame: Se
             mesh.forget(id);
         }
         ServerFrame::Deliver { payload, .. } => mesh.sfu_message(sfu, topic, payload).await,
-        ServerFrame::Error { reason } => println!("sfu      error: {reason}"),
+        ServerFrame::Error { topic, reason } => match topic {
+            Some(topic) => println!("sfu      error on {}: {reason}", topic.fmt_short()),
+            None => println!("sfu      error: {reason}"),
+        },
     }
 }
 

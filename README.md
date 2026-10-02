@@ -21,7 +21,7 @@ This branch is an orphan and shares no history with the Swift SFU on `main`.
 | `src/tls.rs` | PEM loading (reloaded for cert-manager) and self-signed dev certs. |
 | `src/bin/kt-sfu.rs` | The service. |
 | `src/bin/kt-probe.rs` | Probe: subscribes to a topic and measures both mesh and SFU delivery to every other probe in it. |
-| `tests/sfu.rs` | End-to-end tests against an in-process server. |
+| `tests/sfu.rs`, `tests/protocol.rs` | End-to-end tests against an in-process server (`tests/common` is the harness). |
 
 ## Design rules
 
@@ -44,19 +44,25 @@ ALPN is `keeptalking/sfu/1`. The client opens one bidirectional stream and sends
 |---|---|---|---|
 | C→S | 0x21 | SUBSCRIBE | topic(32) |
 | C→S | 0x22 | UNSUBSCRIBE | topic(32) |
-| C→S | 0x23 | ANNOUNCE | topic(32) ‖ blob (≤ 16 KiB) |
+| C→S | 0x23 | ANNOUNCE | topic(32) ‖ blob (≤ 1 KiB) |
 | C→S | 0x24 | PUBLISH | topic(32) ‖ payload (≤ 1 MiB) |
-| S→C | 0x31 | SNAPSHOT | topic(32) ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob) |
+| S→C | 0x31 | SNAPSHOT | topic(32) ‖ flags(u8) ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob) |
 | S→C | 0x32 | JOINED | topic(32) ‖ id(32) |
 | S→C | 0x33 | LEFT | topic(32) ‖ id(32) |
 | S→C | 0x34 | PRESENCE | topic(32) ‖ id(32) ‖ blob |
 | S→C | 0x35 | DELIVER | topic(32) ‖ payload |
-| S→C | 0x3F | ERROR | UTF-8 |
+| S→C | 0x3F | ERROR | topic(32) ‖ UTF-8 reason (all-zero topic = not about a topic) |
 
-- After a SUBSCRIBE, the subscriber always gets the SNAPSHOT before any other event for that room.
+- After a SUBSCRIBE, the subscriber's first frame for that topic is its SNAPSHOT. A SUBSCRIBE for a topic the connection already holds is a no-op (no second snapshot).
+- SNAPSHOT is chunked: flags bit 0 is MORE. The SFU cuts chunks at 256 entries or 256 KiB of body and sends them back to back; an empty room is one chunk with n = 0 and MORE clear. Clients merge chunks until one without MORE. Other flag bits are reserved (send 0, ignore).
 - A zero-length blob in a snapshot means the member hasn't announced yet.
+- A room holds at most 1024 members (`ERROR(topic, "room full")`, not subscribed); a connection at most 512 topics (`"too many topics"`). The all-zero topic is reserved.
 - PUBLISH reaches every *other* subscriber as DELIVER; DELIVER doesn't name the sender (the sealed payload does).
+- Refusals are `ERROR(topic, reason)` with fixed reasons: `room full`, `too many topics`, `rate limited`, `not subscribed`, `announce too large`, `publish too large`, `reserved topic`.
+- A frame with a valid length but an unknown tag or malformed body is skipped (the SFU answers `ERROR(0, "malformed frame …")`); clients skip unknown server frames too. A length prefix of 0 or above 1 MiB + 64 KiB is fatal: the connection is closed (SFU close code 2).
 - QUIC datagrams on the SFU connection are `topic(32) ‖ payload`; the SFU forwards the same bytes to every other subscriber, best effort.
+
+The full reference, including close codes, is the module doc of `src/proto.rs`.
 
 ## Run it locally
 

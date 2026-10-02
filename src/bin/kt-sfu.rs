@@ -8,7 +8,7 @@ use clap::Parser;
 use iroh::{RelayUrl, SecretKey};
 use keeptalking_sfu::{
     info,
-    server::{Sfu, SfuConfig},
+    server::{Limits, Sfu, SfuConfig},
     tls::{DevCert, reloading_cert},
 };
 use tracing::info;
@@ -121,6 +121,7 @@ async fn main() -> Result<()> {
         sfu_bind: args.sfu_bind,
         sfu_secret,
         sfu_ca,
+        limits: Limits::default(),
     })
     .await?;
 

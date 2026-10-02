@@ -2,90 +2,18 @@
 //! SFU fan-out of publishes and datagrams, the info endpoint, and peer
 //! connections carried by the embedded relay.
 
+mod common;
+
 use std::{net::Ipv4Addr, time::Duration};
 
 use bytes::Bytes;
-use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::Connection};
+use common::*;
+use iroh::{Endpoint, EndpointAddr, endpoint::Connection};
 use keeptalking_sfu::{
-    client::{ClientOptions, SfuClient, bind_client},
     info,
-    proto::{Member, ServerFrame, Topic},
-    server::{Sfu, SfuConfig},
-    tls::DevCert,
+    proto::{Member, ServerFrame},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
-};
-
-const TEST_ALPN: &[u8] = b"keeptalking/test/1";
-const WAIT: Duration = Duration::from_secs(10);
-
-struct Harness {
-    sfu: Sfu,
-    dev: DevCert,
-}
-
-impl Harness {
-    async fn start() -> Self {
-        let dev = DevCert::generate(&[]).unwrap();
-        let local = |port| (Ipv4Addr::LOCALHOST, port).into();
-        let sfu = Sfu::spawn(SfuConfig {
-            relay_http_bind: local(0),
-            relay_https_bind: local(0),
-            relay_quic_bind: Some(local(0)),
-            cert: dev.cert_config().unwrap(),
-            public_relay_url: None,
-            public_quic_port: None,
-            sfu_bind: vec![local(0)],
-            sfu_secret: SecretKey::generate(),
-            sfu_ca: Some(dev.ca()),
-        })
-        .await
-        .unwrap();
-        Self { sfu, dev }
-    }
-
-    async fn endpoint(&self, relay_only: bool) -> Endpoint {
-        bind_client(ClientOptions {
-            relay_map: self.sfu.relay_map().clone(),
-            ca: Some(self.dev.ca()),
-            alpns: vec![TEST_ALPN.to_vec()],
-            secret_key: None,
-            relay_only,
-        })
-        .await
-        .unwrap()
-    }
-
-    async fn sfu_client(&self, endpoint: &Endpoint) -> (SfuClient, mpsc::Receiver<ServerFrame>) {
-        SfuClient::connect(endpoint, self.sfu.sfu_addr())
-            .await
-            .unwrap()
-    }
-}
-
-async fn next(rx: &mut mpsc::Receiver<ServerFrame>) -> ServerFrame {
-    tokio::time::timeout(WAIT, rx.recv())
-        .await
-        .expect("timed out waiting for frame")
-        .expect("closed")
-}
-
-async fn assert_quiet(rx: &mut mpsc::Receiver<ServerFrame>) {
-    if let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
-        panic!("unexpected frame {frame:?}");
-    }
-}
-
-fn random_topic() -> Topic {
-    Topic(SecretKey::generate().to_bytes())
-}
-
-fn sorted(mut members: Vec<Member>) -> Vec<Member> {
-    members.sort_by_key(|m| *m.id.as_bytes());
-    members
-}
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn room_lifecycle() {
@@ -99,25 +27,19 @@ async fn room_lifecycle() {
 
     let (a, mut ra) = h.sfu_client(&ea).await;
     a.subscribe(topic).await.unwrap();
-    assert_eq!(
-        next(&mut ra).await,
-        ServerFrame::Snapshot {
-            topic,
-            members: vec![]
-        }
-    );
+    assert_eq!(next(&mut ra).await, snapshot(topic, vec![]));
 
     let (b, mut rb) = h.sfu_client(&eb).await;
     b.subscribe(topic).await.unwrap();
     assert_eq!(
         next(&mut rb).await,
-        ServerFrame::Snapshot {
+        snapshot(
             topic,
-            members: vec![Member {
+            vec![Member {
                 id: ea.id(),
                 blob: Bytes::new()
             }]
-        }
+        )
     );
     assert_eq!(
         next(&mut ra).await,
@@ -190,7 +112,7 @@ async fn room_lifecycle() {
     c.announce(topic, Bytes::from_static(b"nope"))
         .await
         .unwrap();
-    assert!(matches!(next(&mut rc).await, ServerFrame::Error { .. }));
+    assert_eq!(next(&mut rc).await, error(topic, "not subscribed"));
     assert_quiet(&mut ra).await;
 
     // Dropping the connection leaves every subscribed room.
@@ -306,7 +228,7 @@ async fn publish_fans_out_to_the_room() {
     d.publish(topic, Bytes::from_static(b"intruder"))
         .await
         .unwrap();
-    assert!(matches!(next(&mut rd).await, ServerFrame::Error { .. }));
+    assert_eq!(next(&mut rd).await, error(topic, "not subscribed"));
     assert_quiet(&mut rb).await;
 }
 
@@ -383,6 +305,8 @@ async fn info_endpoint_serves_sfu_id() {
     assert!(ok.contains(r#""alpn":"keeptalking/sfu/1""#), "{ok}");
     assert!(ok.contains(r#""qad_port":7842"#), "{ok}");
     assert!(get("/other").await.starts_with("HTTP/1.1 404"));
+    // The pre-rename path is gone.
+    assert!(get("/kt/hub").await.starts_with("HTTP/1.1 404"));
 }
 
 /// Peers with no IP transports can only reach each other through the
