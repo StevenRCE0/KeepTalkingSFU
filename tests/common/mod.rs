@@ -7,18 +7,25 @@ use std::{net::Ipv4Addr, time::Duration};
 use bytes::Bytes;
 use iroh::{
     Endpoint, EndpointAddr, SecretKey,
-    endpoint::{Connection, ConnectionError, RecvStream, SendStream},
+    endpoint::{Connection, ConnectionError, QuicTransportConfig, RecvStream, SendStream},
 };
 use keeptalking_sfu::{
-    client::{ClientOptions, SfuClient, bind_client},
-    proto::{ClientFrame, Member, SFU_ALPN, ServerFrame, Topic, read_frame},
-    server::{Limits, RelayRateLimit, Sfu, SfuConfig},
+    client::{ClientOptions, Delivery, Inbox, SfuClient, bind_client},
+    proto::{ClientFrame, Lane, Member, SFU_ALPN, ServerFrame, Topic, read_frame},
+    server::{Limits, Rate, RelayRateLimit, Sfu, SfuConfig},
     tls::DevCert,
 };
-use tokio::sync::mpsc;
 
 pub const TEST_ALPN: &[u8] = b"keeptalking/test/1";
 pub const WAIT: Duration = Duration::from_secs(10);
+
+/// A publish rate no test hits.
+pub const GENEROUS: Rate = Rate {
+    bytes_per_second: 1e12,
+    burst_bytes: 1e12,
+    frames_per_second: 1e9,
+    burst_frames: 1e9,
+};
 
 pub struct Harness {
     pub sfu: Sfu,
@@ -52,12 +59,23 @@ impl Harness {
     }
 
     pub async fn endpoint(&self, relay_only: bool) -> Endpoint {
+        self.bind(relay_only, None).await
+    }
+
+    /// An endpoint with its own QUIC transport settings (e.g. small stream
+    /// windows, to make a slow reader).
+    pub async fn endpoint_with(&self, transport: QuicTransportConfig) -> Endpoint {
+        self.bind(false, Some(transport)).await
+    }
+
+    async fn bind(&self, relay_only: bool, transport: Option<QuicTransportConfig>) -> Endpoint {
         bind_client(ClientOptions {
             relay_map: self.sfu.relay_map().clone(),
             ca: Some(self.dev.ca()),
             alpns: vec![TEST_ALPN.to_vec()],
             secret_key: None,
             relay_only,
+            transport,
         })
         .await
         .unwrap()
@@ -73,27 +91,21 @@ impl Harness {
     }
 
     /// A reference client dialled with only the relay URL (as apps do).
-    pub async fn sfu_client(
-        &self,
-        endpoint: &Endpoint,
-    ) -> (SfuClient, mpsc::Receiver<ServerFrame>) {
+    pub async fn sfu_client(&self, endpoint: &Endpoint) -> (SfuClient, Inbox) {
         SfuClient::connect(endpoint, self.sfu.sfu_addr())
             .await
             .unwrap()
     }
 
     /// A reference client on a direct path.
-    pub async fn direct_client(
-        &self,
-        endpoint: &Endpoint,
-    ) -> (SfuClient, mpsc::Receiver<ServerFrame>) {
+    pub async fn direct_client(&self, endpoint: &Endpoint) -> (SfuClient, Inbox) {
         SfuClient::connect(endpoint, self.direct_addr())
             .await
             .unwrap()
     }
 
     /// A raw connection on a direct path, for frames the reference client
-    /// would never send and for reading chunks as they arrive.
+    /// would never send and for reading streams as they arrive.
     pub async fn raw(&self, endpoint: &Endpoint) -> Raw {
         let conn = tokio::time::timeout(WAIT, endpoint.connect(self.direct_addr(), SFU_ALPN))
             .await
@@ -104,6 +116,7 @@ impl Harness {
     }
 }
 
+/// A raw connection: its session stream plus helpers for lane streams.
 pub struct Raw {
     pub conn: Connection,
     pub send: SendStream,
@@ -115,19 +128,33 @@ impl Raw {
         self.send.write_all(bytes).await.unwrap();
     }
 
+    /// Sends a frame on the session stream.
     pub async fn send(&mut self, frame: ClientFrame) {
         let bytes = frame.encode();
         self.send_bytes(&bytes).await;
     }
 
-    /// The next frame, decoded, without merging snapshot chunks.
+    /// The next session frame, decoded, without merging snapshot chunks.
     pub async fn next(&mut self) -> ServerFrame {
-        let (tag, body) = tokio::time::timeout(WAIT, read_frame(&mut self.recv))
+        read_server_frame(&mut self.recv).await
+    }
+
+    /// Opens a lane stream whose first byte is `first` (a lane byte or not).
+    pub async fn open_stream(&self, first: u8) -> SendStream {
+        let mut send = self.conn.open_uni().await.unwrap();
+        send.write_all(&[first]).await.unwrap();
+        send
+    }
+
+    /// The next stream the SFU opens towards us, with its first byte.
+    pub async fn accept_lane(&self) -> (Lane, RecvStream) {
+        let mut recv = tokio::time::timeout(WAIT, self.conn.accept_uni())
             .await
-            .expect("timed out waiting for frame")
-            .expect("read")
-            .expect("stream ended");
-        ServerFrame::decode(tag, body).expect("decode")
+            .expect("timed out waiting for a lane stream")
+            .expect("accept lane stream");
+        let mut byte = [0u8; 1];
+        recv.read_exact(&mut byte).await.unwrap();
+        (Lane::from_byte(byte[0]).expect("lane byte"), recv)
     }
 
     /// Waits for the SFU to close the connection; returns the application
@@ -146,16 +173,56 @@ impl Raw {
     }
 }
 
-pub async fn next(rx: &mut mpsc::Receiver<ServerFrame>) -> ServerFrame {
-    tokio::time::timeout(WAIT, rx.recv())
+/// Writes `frames` to a client stream.
+pub async fn write_frames(send: &mut SendStream, frames: &[ClientFrame]) {
+    for frame in frames {
+        send.write_all(&frame.encode()).await.unwrap();
+    }
+}
+
+/// The next frame on a stream, decoded.
+pub async fn read_server_frame(recv: &mut RecvStream) -> ServerFrame {
+    let (tag, body) = tokio::time::timeout(WAIT, read_frame(recv))
+        .await
+        .expect("timed out waiting for frame")
+        .expect("read")
+        .expect("stream ended");
+    ServerFrame::decode(tag, body).expect("decode")
+}
+
+/// Waits for the client to stop a stream we send on; returns the code.
+pub async fn stopped(send: &SendStream) -> u64 {
+    tokio::time::timeout(WAIT, send.stopped())
+        .await
+        .expect("stream was not stopped")
+        .expect("stopped")
+        .expect("stopped with a code, not acknowledged")
+        .into_inner()
+}
+
+/// The next session frame of a reference client.
+pub async fn next(inbox: &mut Inbox) -> ServerFrame {
+    tokio::time::timeout(WAIT, inbox.frames.recv())
         .await
         .expect("timed out waiting for frame")
         .expect("closed")
 }
 
-pub async fn assert_quiet(rx: &mut mpsc::Receiver<ServerFrame>) {
-    if let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
-        panic!("unexpected frame {frame:?}");
+/// The next DELIVER of a reference client, from any lane.
+pub async fn delivery(inbox: &mut Inbox) -> Delivery {
+    tokio::time::timeout(WAIT, inbox.deliveries.recv())
+        .await
+        .expect("timed out waiting for a delivery")
+        .expect("closed")
+}
+
+/// Neither a session frame nor a delivery arrives for a while.
+pub async fn assert_quiet(inbox: &mut Inbox) {
+    // A closed channel disables its branch; only the timer ends the wait.
+    tokio::select! {
+        Some(frame) = inbox.frames.recv() => panic!("unexpected frame {frame:?}"),
+        Some(delivery) = inbox.deliveries.recv() => panic!("unexpected delivery {delivery:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
     }
 }
 
@@ -192,6 +259,14 @@ pub fn error(topic: Topic, reason: &str) -> ServerFrame {
     ServerFrame::Error {
         topic: Some(topic),
         reason: reason.into(),
+    }
+}
+
+pub fn deliver(lane: Lane, topic: Topic, payload: impl Into<Bytes>) -> Delivery {
+    Delivery {
+        lane,
+        topic,
+        payload: payload.into(),
     }
 }
 

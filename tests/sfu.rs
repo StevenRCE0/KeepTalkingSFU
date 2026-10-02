@@ -11,7 +11,7 @@ use common::*;
 use iroh::{Endpoint, EndpointAddr, endpoint::Connection};
 use keeptalking_sfu::{
     info,
-    proto::{Member, ServerFrame},
+    proto::{Lane, Member, ServerFrame},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -206,26 +206,24 @@ async fn publish_fans_out_to_the_room() {
     next(&mut ra).await;
     next(&mut rb).await;
 
-    a.publish(topic, Bytes::from_static(b"sealed-envelope"))
-        .await
-        .unwrap();
-    let delivered = ServerFrame::Deliver {
+    a.publish(
+        Lane::Interactive,
         topic,
-        payload: Bytes::from_static(b"sealed-envelope"),
-    };
-    assert_eq!(next(&mut rb).await, delivered);
-    assert_eq!(next(&mut rc).await, delivered);
+        Bytes::from_static(b"sealed-envelope"),
+    )
+    .await
+    .unwrap();
+    let delivered = deliver(Lane::Interactive, topic, &b"sealed-envelope"[..]);
+    assert_eq!(delivery(&mut rb).await, delivered);
+    assert_eq!(delivery(&mut rc).await, delivered);
     assert_quiet(&mut ra).await;
     assert_quiet(&mut rd).await;
-    assert_eq!(
-        h.sfu
-            .stats()
-            .delivered
-            .load(std::sync::atomic::Ordering::Relaxed),
-        2
-    );
+    let stats = h.sfu.stats().snapshot();
+    assert_eq!(stats.published.interactive, 1);
+    assert_eq!(stats.delivered.interactive, 2);
+    assert_eq!(stats.delivered.total(), 2);
 
-    d.publish(topic, Bytes::from_static(b"intruder"))
+    d.publish(Lane::Interactive, topic, Bytes::from_static(b"intruder"))
         .await
         .unwrap();
     assert_eq!(next(&mut rd).await, error(topic, "not subscribed"));
@@ -302,7 +300,7 @@ async fn info_endpoint_serves_sfu_id() {
         ok.contains(&format!(r#""sfu":"{}""#, h.sfu.sfu_id())),
         "{ok}"
     );
-    assert!(ok.contains(r#""alpn":"keeptalking/sfu/1""#), "{ok}");
+    assert!(ok.contains(r#""alpn":"keeptalking/sfu/2""#), "{ok}");
     assert!(ok.contains(r#""qad_port":7842"#), "{ok}");
     assert!(get("/other").await.starts_with("HTTP/1.1 404"));
     // The pre-rename path is gone.

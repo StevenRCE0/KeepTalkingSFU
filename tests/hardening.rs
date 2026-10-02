@@ -10,17 +10,9 @@ use bytes::Bytes;
 use common::*;
 use iroh::endpoint::Connection;
 use keeptalking_sfu::{
-    client::SfuClient,
-    proto::{ClientFrame, SFU_ALPN, ServerFrame, Topic, close},
+    client::{Inbox, SfuClient},
+    proto::{ClientFrame, Lane, SFU_ALPN, ServerFrame, Topic, close},
     server::{Limits, Rate},
-};
-use tokio::sync::mpsc;
-
-const GENEROUS: Rate = Rate {
-    bytes_per_second: 1e12,
-    burst_bytes: 1e12,
-    frames_per_second: 1e9,
-    burst_frames: 1e9,
 };
 
 /// A publisher, a healthy reader and a reader that never reads, all in one
@@ -29,7 +21,7 @@ struct SlowRoom {
     topic: Topic,
     publisher: SfuClient,
     healthy: SfuClient,
-    healthy_rx: mpsc::Receiver<ServerFrame>,
+    healthy_rx: Inbox,
     slow: Raw,
     slow_id: iroh::EndpointId,
     _endpoints: Vec<iroh::Endpoint>,
@@ -55,7 +47,7 @@ async fn slow_room(h: &Harness) -> SlowRoom {
     })
     .await;
     // The publisher's own frames are irrelevant; keep its queue drained.
-    tokio::spawn(async move { while pa.recv().await.is_some() {} });
+    tokio::spawn(async move { while pa.frames.recv().await.is_some() {} });
     SlowRoom {
         topic,
         publisher,
@@ -67,53 +59,59 @@ async fn slow_room(h: &Harness) -> SlowRoom {
     }
 }
 
-/// Publishes `count` payloads of 64 KiB, paced well below what a healthy
-/// reader drains (~6 MB/s), and checks the healthy reader gets every one of
-/// them, then sees the slow reader leave.
-async fn publish_and_check_healthy(room: &mut SlowRoom, count: usize) {
+/// Publishes `count` payloads of 64 KiB on `lane`, paced well below what a
+/// healthy reader drains (~6 MB/s), and checks the healthy reader gets every
+/// one of them, then sees the slow reader leave.
+async fn publish_and_check_healthy(room: &mut SlowRoom, lane: Lane, count: usize) {
     let len = 64 * 1024;
     let mut tick = tokio::time::interval(Duration::from_millis(10));
     for _ in 0..count {
         tick.tick().await;
         room.publisher
-            .publish(room.topic, bytes(len))
+            .publish(lane, room.topic, bytes(len))
             .await
             .unwrap();
     }
     let (mut delivered, mut slow_left) = (0, false);
+    let closed = |delivered| {
+        panic!(
+            "healthy reader closed after {delivered} deliveries: {:?}",
+            room.healthy.connection().close_reason()
+        )
+    };
     while delivered < count || !slow_left {
-        let frame = tokio::time::timeout(WAIT, room.healthy_rx.recv())
-            .await
-            .expect("timed out");
-        let Some(frame) = frame else {
-            panic!(
-                "healthy reader closed after {delivered} deliveries: {:?}",
-                room.healthy.connection().close_reason()
-            );
-        };
-        match frame {
-            ServerFrame::Deliver { payload, .. } => {
-                assert_eq!(payload.len(), len);
-                delivered += 1;
-            }
-            ServerFrame::Left { id, .. } => {
-                assert_eq!(id, room.slow_id);
-                slow_left = true;
-            }
-            ServerFrame::Joined { .. } => {}
-            other => panic!("unexpected {other:?}"),
+        tokio::select! {
+            frame = room.healthy_rx.frames.recv() => match frame {
+                Some(ServerFrame::Left { id, .. }) => {
+                    assert_eq!(id, room.slow_id);
+                    slow_left = true;
+                }
+                Some(ServerFrame::Joined { .. }) => {}
+                Some(other) => panic!("unexpected {other:?}"),
+                None => closed(delivered),
+            },
+            got = room.healthy_rx.deliveries.recv() => match got {
+                Some(got) => {
+                    assert_eq!((got.lane, got.payload.len()), (lane, len));
+                    delivered += 1;
+                }
+                None => closed(delivered),
+            },
+            _ = tokio::time::sleep(WAIT) => panic!("timed out after {delivered} deliveries"),
         }
     }
     assert!(room.publisher.connection().close_reason().is_none());
     assert!(room.healthy.connection().close_reason().is_none());
 }
 
-/// A reader whose queue outgrows the byte budget is disconnected; the
-/// publisher and the other reader carry on with every frame.
+/// A reader whose interactive queue outgrows the byte budget is
+/// disconnected; the publisher and the other reader carry on with every
+/// frame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_consumer_is_dropped_by_byte_budget() {
-    // The non-reader buffers ~1.25 MB in QUIC before its queue grows, so 64
-    // publishes (4 MiB) overflow a 1 MiB budget.
+    // The non-reader buffers ~1.25 MB in QUIC (its interactive stream's
+    // window) before its queue grows, so 64 publishes (4 MiB) overflow a
+    // 1 MiB budget.
     let h = Harness::with_limits(Limits {
         outbox_bytes: 1024 * 1024,
         stall_timeout: Duration::from_secs(60),
@@ -122,7 +120,7 @@ async fn slow_consumer_is_dropped_by_byte_budget() {
     })
     .await;
     let mut room = slow_room(&h).await;
-    publish_and_check_healthy(&mut room, 64).await;
+    publish_and_check_healthy(&mut room, Lane::Interactive, 64).await;
     assert_eq!(
         room.slow.closed().await,
         (u64::from(close::SLOW_CONSUMER), "slow consumer".into())
@@ -134,7 +132,7 @@ async fn slow_consumer_is_dropped_by_byte_budget() {
     assert_eq!(h.sfu.members(room.topic).len(), 2);
 }
 
-/// A reader whose stream accepts no bytes for the stall timeout is
+/// A reader whose control stream accepts no bytes for the stall timeout is
 /// disconnected even though its queue is within budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stalled_consumer_is_dropped() {
@@ -146,7 +144,7 @@ async fn stalled_consumer_is_dropped() {
     })
     .await;
     let mut room = slow_room(&h).await;
-    publish_and_check_healthy(&mut room, 48).await;
+    publish_and_check_healthy(&mut room, Lane::Control, 48).await;
     assert_eq!(
         room.slow.closed().await,
         (u64::from(close::STALLED), "stalled".into())
@@ -155,19 +153,19 @@ async fn stalled_consumer_is_dropped() {
     assert_eq!(h.sfu.stats().slow_consumers.load(Ordering::Relaxed), 0);
 }
 
-/// Collects DELIVERs on `rx` and ERRORs on `errors_rx` until `total` frames
-/// were accounted for.
+/// Collects DELIVERs on `deliveries` and ERRORs on `errors` until `total`
+/// frames were accounted for.
 async fn tally(
-    deliveries: &mut mpsc::Receiver<ServerFrame>,
-    errors: &mut mpsc::Receiver<ServerFrame>,
+    deliveries: &mut Inbox,
+    errors: &mut Inbox,
     topic: Topic,
     total: usize,
 ) -> (usize, usize) {
     let (mut delivered, mut refused) = (0, 0);
     while delivered + refused < total {
         tokio::select! {
-            frame = next(deliveries) => {
-                assert!(matches!(frame, ServerFrame::Deliver { .. }), "{frame:?}");
+            got = delivery(deliveries) => {
+                assert_eq!(got.topic, topic);
                 delivered += 1;
             }
             frame = next(errors) => {
@@ -179,8 +177,8 @@ async fn tally(
     (delivered, refused)
 }
 
-/// PUBLISH beyond the frame rate is refused with ERROR(topic, "rate
-/// limited") and not forwarded.
+/// PUBLISH and PUBLISH_TO beyond the frame rate, on any lane, are refused
+/// with ERROR(topic, "rate limited") and not forwarded.
 #[tokio::test]
 async fn publish_rate_limit_by_frames() {
     let h = Harness::with_limits(Limits {
@@ -203,8 +201,18 @@ async fn publish_rate_limit_by_frames() {
     next(&mut rb).await;
     next(&mut ra).await; // joined b
 
-    for _ in 0..30 {
-        a.publish(topic, Bytes::from_static(b"m")).await.unwrap();
+    // One bucket across lanes, broadcast and directed alike.
+    for i in 0..30 {
+        let lane = Lane::ALL[i % 3];
+        if i % 2 == 0 {
+            a.publish(lane, topic, Bytes::from_static(b"m"))
+                .await
+                .unwrap();
+        } else {
+            a.publish_to(lane, topic, eb.id(), Bytes::from_static(b"m"))
+                .await
+                .unwrap();
+        }
     }
     let (delivered, refused) = tally(&mut rb, &mut ra, topic, 30).await;
     assert!((10..15).contains(&delivered), "{delivered} delivered");
@@ -216,7 +224,8 @@ async fn publish_rate_limit_by_frames() {
     assert_quiet(&mut rb).await;
 }
 
-/// PUBLISH and ANNOUNCE share a byte budget.
+/// PUBLISH (lane streams) and ANNOUNCE (session stream) share a byte
+/// budget.
 #[tokio::test]
 async fn publish_rate_limit_by_bytes() {
     let h = Harness::with_limits(Limits {
@@ -239,8 +248,8 @@ async fn publish_rate_limit_by_bytes() {
     next(&mut rb).await;
     next(&mut ra).await; // joined b
 
-    for _ in 0..3 {
-        a.publish(topic, bytes(60 * 1024)).await.unwrap();
+    for lane in [Lane::Interactive, Lane::Bulk, Lane::Control] {
+        a.publish(lane, topic, bytes(60 * 1024)).await.unwrap();
     }
     let (delivered, refused) = tally(&mut rb, &mut ra, topic, 3).await;
     assert_eq!((delivered, refused), (2, 1));

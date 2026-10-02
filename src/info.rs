@@ -4,7 +4,7 @@
 //! for the SFU id.
 //!
 //! `GET /kt/sfu` returns
-//! `{"sfu":"<hex id>","relay":"<url>","alpn":"keeptalking/sfu/1","qad_port":7842}`.
+//! `{"sfu":"<hex id>","relay":"<url>","alpn":"keeptalking/sfu/2","qad_port":7842}`.
 //! Anything else is a 404. Hand-rolled on purpose: one route, no framework.
 //! [`fetch_info`] is the matching client (used by `kt-probe --info`).
 
@@ -234,7 +234,7 @@ mod tests {
             SfuInfo {
                 sfu: id,
                 relay: "https://relay.example/".parse().unwrap(),
-                alpn: "keeptalking/sfu/1".into(),
+                alpn: "keeptalking/sfu/2".into(),
                 qad_port: Some(7842),
             }
         );

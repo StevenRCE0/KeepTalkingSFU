@@ -1,8 +1,9 @@
 //! Wire format of the SFU protocol (ALPN [`SFU_ALPN`]).
 //!
-//! A client opens exactly one bidirectional QUIC stream on its connection to
-//! the SFU and speaks first. Both directions carry length-prefixed,
-//! type-tagged frames:
+//! A client's connection to the SFU carries one **session stream** for room
+//! management, unidirectional **lane streams** for publishes and deliveries,
+//! and QUIC datagrams. Every stream carries length-prefixed, type-tagged
+//! frames:
 //!
 //! ```text
 //! [4-byte BE length = 1 + body] [1-byte type] [body]
@@ -15,33 +16,89 @@
 //! reserved (it marks an ERROR that is not about a topic) and cannot be
 //! subscribed to.
 //!
-//! # Client → server
+//! # Session stream
 //!
-//! | tag  | frame       | body                          |
-//! |------|-------------|-------------------------------|
-//! | 0x21 | SUBSCRIBE   | topic(32)                     |
-//! | 0x22 | UNSUBSCRIBE | topic(32)                     |
-//! | 0x23 | ANNOUNCE    | topic(32) ‖ blob (≤ 1 KiB)    |
-//! | 0x24 | PUBLISH     | topic(32) ‖ payload (≤ 1 MiB) |
+//! The client opens exactly one bidirectional stream, before any lane
+//! stream, and speaks first (the SFU only sees the stream once bytes arrive
+//! on it). It carries room management only.
 //!
-//! # Server → client
+//! | dir | tag  | frame       | body                                                           |
+//! |-----|------|-------------|----------------------------------------------------------------|
+//! | C→S | 0x21 | SUBSCRIBE   | topic(32)                                                      |
+//! | C→S | 0x22 | UNSUBSCRIBE | topic(32)                                                      |
+//! | C→S | 0x23 | ANNOUNCE    | topic(32) ‖ blob (≤ 1 KiB)                                     |
+//! | S→C | 0x31 | SNAPSHOT    | topic ‖ flags(u8) ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob[len]) |
+//! | S→C | 0x32 | JOINED      | topic ‖ id(32)                                                 |
+//! | S→C | 0x33 | LEFT        | topic ‖ id(32)                                                 |
+//! | S→C | 0x34 | PRESENCE    | topic ‖ id(32) ‖ blob                                          |
+//! | S→C | 0x3F | ERROR       | topic ‖ UTF-8 reason (all-zero topic: not about a topic)       |
 //!
-//! | tag  | frame    | body                                                            |
-//! |------|----------|-----------------------------------------------------------------|
-//! | 0x31 | SNAPSHOT | topic ‖ flags(u8) ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob[len])  |
-//! | 0x32 | JOINED   | topic ‖ id(32)                                                  |
-//! | 0x33 | LEFT     | topic ‖ id(32)                                                  |
-//! | 0x34 | PRESENCE | topic ‖ id(32) ‖ blob                                           |
-//! | 0x35 | DELIVER  | topic ‖ payload                                                 |
-//! | 0x3F | ERROR    | topic ‖ UTF-8 reason (all-zero topic: not about a topic)        |
+//! A PUBLISH or PUBLISH_TO on the session stream is refused with
+//! `ERROR(topic, "publish on a lane stream")` and dropped.
 //!
-//! ## Rooms
+//! # Lane streams
 //!
-//! - SUBSCRIBE joins the topic's room. The subscriber's first frame for that
-//!   topic is its SNAPSHOT (the other members and their latest blobs); every
-//!   later JOINED/LEFT/PRESENCE/DELIVER for the topic follows it. A SUBSCRIBE
-//!   for a topic the connection already holds is a no-op: no second
-//!   snapshot, no JOINED.
+//! Publishes and deliveries travel on unidirectional streams. The first
+//! byte of a lane stream names its [`Lane`]; frames follow.
+//!
+//! | byte | lane        | client → SFU streams        | SFU → client streams                    |
+//! |------|-------------|-----------------------------|-----------------------------------------|
+//! | 0x01 | control     | long-lived, many frames     | one per client, opened on first DELIVER |
+//! | 0x02 | interactive | long-lived, many frames     | one per client, opened on first DELIVER |
+//! | 0x03 | bulk        | one frame per stream, FIN   | one DELIVER per stream, then FIN        |
+//!
+//! | dir | tag  | frame      | body                                                   |
+//! |-----|------|------------|--------------------------------------------------------|
+//! | C→S | 0x24 | PUBLISH    | topic(32) ‖ payload (≤ 1 MiB)                          |
+//! | C→S | 0x25 | PUBLISH_TO | topic(32) ‖ recipient endpoint id(32) ‖ payload        |
+//! | S→C | 0x35 | DELIVER    | topic(32) ‖ payload                                    |
+//!
+//! - PUBLISH is reliable fan-out: the SFU sends DELIVER with the same payload
+//!   to every *other* subscriber of the topic, on the lane it arrived on, so
+//!   a sender uploads once however large the room.
+//! - PUBLISH_TO is directed: the SFU sends DELIVER only to `recipient`, on
+//!   the same lane, if it is subscribed to the topic and is not the sender;
+//!   otherwise it answers `ERROR(topic, "no such recipient")` on the session
+//!   stream. Large rooms use it instead of a full mesh of connections.
+//! - DELIVER does not name the sender (the sealed payload does), and is the
+//!   same frame whichever way it was published.
+//! - The sender must be subscribed to the topic, whatever the lane.
+//! - A first byte that is not a lane: the SFU stops the stream
+//!   (STOP_SENDING [`stream_error::UNKNOWN_LANE`]).
+//! - A client bulk stream carries exactly one frame, then FIN. Data after the
+//!   frame: the SFU stops the stream ([`stream_error::BULK_TRAILING`]); the
+//!   frame itself was already forwarded.
+//! - Only PUBLISH and PUBLISH_TO belong on lane streams. A malformed frame
+//!   (valid length, bad tag or body) on a control or interactive stream is
+//!   skipped like on the session stream; on a bulk stream the SFU stops the
+//!   stream ([`stream_error::MALFORMED`]).
+//! - The SFU resets a bulk stream towards a client that makes no progress
+//!   for its stall timeout ([`stream_error::STALLED`]); the connection stays.
+//!
+//! ## Ordering
+//!
+//! Streams are independent. DELIVERs on one control or interactive stream
+//! keep the order the SFU forwarded them in (per publisher, the order it
+//! published them on that lane). Nothing is ordered across lanes, across
+//! bulk streams, or between lane streams and the session stream: a DELIVER
+//! may arrive before its topic's SNAPSHOT is complete, and a lane frame can
+//! overtake the SUBSCRIBE it depends on, so a client publishes to a topic
+//! only once its SNAPSHOT has arrived.
+//!
+//! ## Priorities
+//!
+//! Both sides set QUIC send priorities on the streams they open (see
+//! [`priority`]): control and session above interactive above bulk. In noq
+//! a higher value is sent first and equal values share round-robin, so a
+//! large bulk transfer never holds up control frames queued behind it.
+//!
+//! # Rooms
+//!
+//! - SUBSCRIBE joins the topic's room. The subscriber's first session frame
+//!   for that topic is its SNAPSHOT (the other members and their latest
+//!   blobs); every later JOINED/LEFT/PRESENCE for the topic follows it. A
+//!   SUBSCRIBE for a topic the connection already holds is a no-op: no
+//!   second snapshot, no JOINED.
 //! - SNAPSHOT is chunked. Flags bit 0 is **MORE**: more chunks of this
 //!   topic's snapshot follow. The SFU cuts a chunk at
 //!   [`SNAPSHOT_CHUNK_ENTRIES`] entries or [`SNAPSHOT_CHUNK_BYTES`] of body,
@@ -57,12 +114,10 @@
 //! - ANNOUNCE stores the sender's presence blob (its context-sealed endpoint
 //!   id) and is relayed as PRESENCE; a late subscriber gets every latest blob
 //!   in its SNAPSHOT. A zero-length blob means "not announced yet".
-//! - PUBLISH is reliable fan-out: the SFU sends DELIVER with the same payload
-//!   to every *other* subscriber, so a sender uploads once however large the
-//!   room. DELIVER does not name the sender; the sealed payload does.
-//! - Only subscribers may ANNOUNCE, PUBLISH or send datagrams to a topic.
+//! - Only subscribers may ANNOUNCE, PUBLISH, PUBLISH_TO or send datagrams to
+//!   a topic.
 //!
-//! ## Errors
+//! # Errors
 //!
 //! ERROR names the topic it is about, or the all-zero topic. Refused frames
 //! have no other effect. The reasons the SFU sends for refusals are fixed
@@ -70,23 +125,28 @@
 //!
 //! ## Framing errors
 //!
-//! - A length prefix of 0 or above [`MAX_FRAME_LEN`] is fatal: the receiver
-//!   closes the connection (the SFU with [`close::PROTOCOL`]).
+//! - A length prefix of 0 or above [`MAX_FRAME_LEN`], on any stream, is
+//!   fatal: the receiver closes the connection (the SFU with
+//!   [`close::PROTOCOL`]).
 //! - A frame with a valid length but an unknown tag or malformed body is
-//!   skipped and the connection continues. The SFU counts it and answers
-//!   `ERROR(0, …)`; clients must skip unknown server frames the same way.
+//!   skipped and the stream continues (except on bulk streams, see above).
+//!   The SFU counts it and answers `ERROR(0, …)`; clients must skip unknown
+//!   server frames the same way.
 //!
-//! ## Server policy
+//! # Server policy
 //!
 //! The SFU bounds each connection (defaults in `server::Limits`): a per
-//! connection token bucket for PUBLISH+ANNOUNCE (bytes and frames; over the
-//! limit → `ERROR(topic, "rate limited")`, frame dropped), one for room joins
-//! (over the limit → `ERROR(topic, "rate limited")`, not subscribed) and one
-//! for datagrams (over the limit → dropped silently). A connection whose
-//! outbound queue exceeds its byte budget is closed with
-//! [`close::SLOW_CONSUMER`]; one whose stream makes no write progress for the
-//! stall timeout with [`close::STALLED`]; one that opens no stream in time
-//! with [`close::NO_STREAM`].
+//! connection token bucket for PUBLISH+PUBLISH_TO+ANNOUNCE across all lanes
+//! (bytes and frames; over the limit → `ERROR(topic, "rate limited")`, frame
+//! dropped), one for room joins (over the limit → `ERROR(topic, "rate
+//! limited")`, not subscribed) and one for datagrams (over the limit →
+//! dropped silently). Outbound, the session stream and the control and
+//! interactive lanes share one byte budget: a connection over it is closed
+//! with [`close::SLOW_CONSUMER`], one whose session, control or interactive
+//! stream makes no write progress for the stall timeout with
+//! [`close::STALLED`]. Bulk has its own budget: over it the SFU drops that
+//! connection's oldest queued bulk deliveries instead. A connection that
+//! opens no session stream in time is closed with [`close::NO_STREAM`].
 //!
 //! # Datagrams
 //!
@@ -101,7 +161,7 @@ use iroh::EndpointId;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// ALPN for the SFU protocol.
-pub const SFU_ALPN: &[u8] = b"keeptalking/sfu/1";
+pub const SFU_ALPN: &[u8] = b"keeptalking/sfu/2";
 /// Largest presence blob a client may announce. Real blobs are ~112 bytes.
 pub const MAX_ANNOUNCE_LEN: usize = 1024;
 /// Largest payload a client may publish (one sealed envelope).
@@ -125,6 +185,7 @@ pub mod tag {
     pub const UNSUBSCRIBE: u8 = 0x22;
     pub const ANNOUNCE: u8 = 0x23;
     pub const PUBLISH: u8 = 0x24;
+    pub const PUBLISH_TO: u8 = 0x25;
     pub const SNAPSHOT: u8 = 0x31;
     pub const JOINED: u8 = 0x32;
     pub const LEFT: u8 = 0x33;
@@ -149,6 +210,12 @@ pub mod reason {
     pub const PUBLISH_TOO_LARGE: &str = "publish too large";
     /// SUBSCRIBE to the all-zero topic.
     pub const RESERVED_TOPIC: &str = "reserved topic";
+    /// PUBLISH/PUBLISH_TO on the session stream: publishes belong on a lane
+    /// stream.
+    pub const PUBLISH_ON_SESSION: &str = "publish on a lane stream";
+    /// PUBLISH_TO whose recipient is not subscribed to the topic, or is the
+    /// sender.
+    pub const NO_SUCH_RECIPIENT: &str = "no such recipient";
 }
 
 /// Application close codes the SFU uses.
@@ -161,8 +228,107 @@ pub mod close {
     pub const PROTOCOL: u32 = 2;
     /// The stream made no write progress for the stall timeout.
     pub const STALLED: u32 = 3;
-    /// The client did not open its stream in time.
+    /// The client did not open its session stream in time.
     pub const NO_STREAM: u32 = 4;
+}
+
+/// Application error codes on lane streams: STOP_SENDING on a client's
+/// stream, RESET_STREAM on one of the SFU's bulk streams.
+pub mod stream_error {
+    /// The stream's first byte is not a lane.
+    pub const UNKNOWN_LANE: u32 = 1;
+    /// A bulk stream carried data after its one frame.
+    pub const BULK_TRAILING: u32 = 2;
+    /// A bulk stream's frame was malformed or not a lane frame.
+    pub const MALFORMED: u32 = 3;
+    /// A bulk delivery made no progress for the stall timeout.
+    pub const STALLED: u32 = 4;
+}
+
+/// QUIC send priorities for the streams each side opens. In noq (as in
+/// quinn) buffered data of a higher-priority stream is sent first and
+/// streams of equal priority share round-robin; the default is 0.
+pub mod priority {
+    /// The session stream: room management and ERROR.
+    pub const SESSION: i32 = 2;
+    pub const CONTROL: i32 = 2;
+    pub const INTERACTIVE: i32 = 1;
+    pub const BULK: i32 = 0;
+}
+
+/// The lane a lane stream carries, named by the stream's first byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Lane {
+    /// Small, latency-critical frames: acks, liveness, signalling.
+    Control,
+    /// Ordinary messages.
+    Interactive,
+    /// Large payloads (context-sync pages): one frame per stream, dropped
+    /// rather than queued without bound for a slow receiver.
+    Bulk,
+}
+
+impl Lane {
+    pub const ALL: [Lane; 3] = [Lane::Control, Lane::Interactive, Lane::Bulk];
+
+    /// The lane named by a stream's first byte.
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x01 => Some(Lane::Control),
+            0x02 => Some(Lane::Interactive),
+            0x03 => Some(Lane::Bulk),
+            _ => None,
+        }
+    }
+
+    pub fn byte(self) -> u8 {
+        match self {
+            Lane::Control => 0x01,
+            Lane::Interactive => 0x02,
+            Lane::Bulk => 0x03,
+        }
+    }
+
+    /// The first byte of a stream of this lane, ready to write.
+    pub fn prefix(self) -> Bytes {
+        match self {
+            Lane::Control => Bytes::from_static(&[0x01]),
+            Lane::Interactive => Bytes::from_static(&[0x02]),
+            Lane::Bulk => Bytes::from_static(&[0x03]),
+        }
+    }
+
+    /// 0, 1, 2 in [`Lane::ALL`] order, for per-lane arrays.
+    pub fn index(self) -> usize {
+        match self {
+            Lane::Control => 0,
+            Lane::Interactive => 1,
+            Lane::Bulk => 2,
+        }
+    }
+
+    /// QUIC send priority of this lane's streams.
+    pub fn priority(self) -> i32 {
+        match self {
+            Lane::Control => priority::CONTROL,
+            Lane::Interactive => priority::INTERACTIVE,
+            Lane::Bulk => priority::BULK,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Lane::Control => "control",
+            Lane::Interactive => "interactive",
+            Lane::Bulk => "bulk",
+        }
+    }
+}
+
+impl fmt::Display for Lane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// A room key: 32 opaque bytes the clients derive from their context secret.
@@ -215,10 +381,25 @@ pub fn hex(bytes: &[u8]) -> String {
 /// A frame sent by a client to the SFU.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientFrame {
-    Subscribe { topic: Topic },
-    Unsubscribe { topic: Topic },
-    Announce { topic: Topic, blob: Bytes },
-    Publish { topic: Topic, payload: Bytes },
+    Subscribe {
+        topic: Topic,
+    },
+    Unsubscribe {
+        topic: Topic,
+    },
+    Announce {
+        topic: Topic,
+        blob: Bytes,
+    },
+    Publish {
+        topic: Topic,
+        payload: Bytes,
+    },
+    PublishTo {
+        topic: Topic,
+        recipient: EndpointId,
+        payload: Bytes,
+    },
 }
 
 /// One entry of a [`ServerFrame::Snapshot`].
@@ -286,7 +467,35 @@ impl ClientFrame {
                     out.put_slice(payload);
                 })
             }
+            ClientFrame::PublishTo {
+                topic,
+                recipient,
+                payload,
+            } => encode(tag::PUBLISH_TO, 64 + payload.len(), |out| {
+                out.put_slice(topic.as_bytes());
+                out.put_slice(recipient.as_bytes());
+                out.put_slice(payload);
+            }),
         }
+    }
+
+    /// The frame's topic.
+    pub fn topic(&self) -> Topic {
+        match self {
+            ClientFrame::Subscribe { topic }
+            | ClientFrame::Unsubscribe { topic }
+            | ClientFrame::Announce { topic, .. }
+            | ClientFrame::Publish { topic, .. }
+            | ClientFrame::PublishTo { topic, .. } => *topic,
+        }
+    }
+
+    /// PUBLISH and PUBLISH_TO, the frames that belong on lane streams.
+    pub fn is_lane_frame(&self) -> bool {
+        matches!(
+            self,
+            ClientFrame::Publish { .. } | ClientFrame::PublishTo { .. }
+        )
     }
 
     pub fn decode(tag: u8, mut body: Bytes) -> Result<Self> {
@@ -305,6 +514,15 @@ impl ClientFrame {
                 let topic = take_topic(&mut body)?;
                 return Ok(ClientFrame::Publish {
                     topic,
+                    payload: body,
+                });
+            }
+            tag::PUBLISH_TO => {
+                let topic = take_topic(&mut body)?;
+                let recipient = take_id(&mut body)?;
+                return Ok(ClientFrame::PublishTo {
+                    topic,
+                    recipient,
                     payload: body,
                 });
             }
@@ -587,6 +805,17 @@ pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<(u8
     Ok(Some((tag, buf)))
 }
 
+/// Reads a lane stream's first byte. `Ok(None)` if the stream ends before
+/// it. The byte is not validated: see [`Lane::from_byte`].
+pub async fn read_lane_byte<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<u8>> {
+    let mut byte = [0u8; 1];
+    match recv.read_exact(&mut byte).await {
+        Ok(_) => Ok(Some(byte[0])),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 pub async fn write_frame<W: AsyncWrite + Unpin>(send: &mut W, frame: &Bytes) -> Result<()> {
     send.write_all(frame).await?;
     Ok(())
@@ -629,6 +858,16 @@ mod tests {
             ClientFrame::Publish {
                 topic,
                 payload: Bytes::from_static(b"payload"),
+            },
+            ClientFrame::PublishTo {
+                topic,
+                recipient: id(5),
+                payload: Bytes::from_static(b"directed"),
+            },
+            ClientFrame::PublishTo {
+                topic,
+                recipient: id(6),
+                payload: Bytes::new(),
             },
         ] {
             assert_eq!(roundtrip_client(frame.clone()).await, frame);
@@ -848,9 +1087,52 @@ mod tests {
         );
 
         assert!(ClientFrame::decode(tag::SUBSCRIBE, Bytes::from_static(&[0; 31])).is_err());
+        // PUBLISH_TO needs a whole recipient id after the topic.
+        assert!(ClientFrame::decode(tag::PUBLISH_TO, Bytes::from_static(&[1; 63])).is_err());
         assert!(ClientFrame::decode(tag::SUBSCRIBE, Bytes::from_static(&[0; 33])).is_err());
         assert!(ServerFrame::decode(0x99, Bytes::new()).is_err());
         assert!(ServerFrame::decode(tag::ERROR, Bytes::from_static(b"short")).is_err());
+    }
+
+    #[test]
+    fn publish_to_layout_and_lanes() {
+        let topic = Topic([0xAB; 32]);
+        let recipient = id(7);
+        let encoded = ClientFrame::PublishTo {
+            topic,
+            recipient,
+            payload: Bytes::from_static(b"hi"),
+        }
+        .encode();
+        assert_eq!(&encoded[..5], &[0, 0, 0, 67, tag::PUBLISH_TO]);
+        assert_eq!(&encoded[5..37], &[0xAB; 32]);
+        assert_eq!(&encoded[37..69], recipient.as_bytes());
+        assert_eq!(&encoded[69..], b"hi");
+
+        for lane in Lane::ALL {
+            assert_eq!(Lane::from_byte(lane.byte()), Some(lane));
+            assert_eq!(&lane.prefix()[..], &[lane.byte()]);
+            assert_eq!(Lane::ALL[lane.index()], lane);
+        }
+        assert_eq!(
+            Lane::ALL.map(Lane::byte),
+            [0x01, 0x02, 0x03],
+            "lane bytes are wire format"
+        );
+        for byte in [0x00, 0x04, 0x21, 0xFF] {
+            assert_eq!(Lane::from_byte(byte), None);
+        }
+        const {
+            assert!(
+                priority::CONTROL > priority::INTERACTIVE && priority::INTERACTIVE > priority::BULK
+            )
+        };
+    }
+
+    #[tokio::test]
+    async fn lane_byte_reads() {
+        assert_eq!(read_lane_byte(&mut &[0x03, 9][..]).await.unwrap(), Some(3));
+        assert_eq!(read_lane_byte(&mut &b""[..]).await.unwrap(), None);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use clap::Parser;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl,
@@ -27,9 +27,9 @@ use iroh::{
 };
 use iroh_relay::RelayQuicConfig;
 use keeptalking_sfu::{
-    client::{ClientOptions, SfuClient, bind_client},
+    client::{ClientOptions, Delivery, SfuClient, bind_client},
     info,
-    proto::{ServerFrame, Topic},
+    proto::{Lane, ServerFrame, Topic},
     tls::ca_from_pem_file,
 };
 use n0_future::StreamExt;
@@ -133,6 +133,7 @@ async fn room(args: RoomArgs) -> Result<()> {
         alpns: vec![PROBE_ALPN.to_vec()],
         secret_key: None,
         relay_only: args.relay_only,
+        transport: None,
     })
     .await?;
     let me = endpoint.id();
@@ -148,7 +149,7 @@ async fn room(args: RoomArgs) -> Result<()> {
     println!("topic    {topic}");
 
     let sfu_addr = EndpointAddr::new(sfu_id).with_relay_url(relay.clone());
-    let (sfu, mut frames) = SfuClient::connect(&endpoint, sfu_addr).await?;
+    let (sfu, mut inbox) = SfuClient::connect(&endpoint, sfu_addr).await?;
     let sfu = Arc::new(sfu);
     println!("sfu      connected in {:?}", started.elapsed());
     sfu.subscribe(topic).await?;
@@ -180,12 +181,15 @@ async fn room(args: RoomArgs) -> Result<()> {
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            frame = frames.recv() => {
+            frame = inbox.frames.recv() => {
                 let Some(frame) = frame else {
                     println!("sfu      connection closed");
                     break;
                 };
-                handle_frame(&mesh, &sfu, topic, frame).await;
+                handle_frame(&mesh, frame);
+            }
+            Some(delivery) = inbox.deliveries.recv() => {
+                mesh.sfu_message(&sfu, topic, delivery).await;
             }
             _ = tokio::signal::ctrl_c() => break,
             _ = &mut deadline => break,
@@ -198,7 +202,7 @@ async fn room(args: RoomArgs) -> Result<()> {
     Ok(())
 }
 
-async fn handle_frame(mesh: &Arc<Mesh>, sfu: &SfuClient, topic: Topic, frame: ServerFrame) {
+fn handle_frame(mesh: &Arc<Mesh>, frame: ServerFrame) {
     match frame {
         ServerFrame::Snapshot { members, .. } => {
             println!("room     snapshot: {} other member(s)", members.len());
@@ -212,7 +216,8 @@ async fn handle_frame(mesh: &Arc<Mesh>, sfu: &SfuClient, topic: Topic, frame: Se
             println!("room     - {}", id.fmt_short());
             mesh.forget(id);
         }
-        ServerFrame::Deliver { payload, .. } => mesh.sfu_message(sfu, topic, payload).await,
+        // DELIVERs arrive on lane streams, as `Delivery`.
+        ServerFrame::Deliver { .. } => {}
         ServerFrame::Error { topic, reason } => match topic {
             Some(topic) => println!("sfu      error on {}: {reason}", topic.fmt_short()),
             None => println!("sfu      error: {reason}"),
@@ -302,7 +307,8 @@ impl Mesh {
 
     /// A payload the SFU fanned out to us: a ping to answer or a pong to
     /// time. `P ‖ from ‖ seq ‖ t_ns` / `Q ‖ to ‖ from ‖ seq ‖ t_ns`.
-    async fn sfu_message(&self, sfu: &SfuClient, topic: Topic, mut payload: Bytes) {
+    async fn sfu_message(&self, sfu: &SfuClient, topic: Topic, delivery: Delivery) {
+        let mut payload = delivery.payload;
         if payload.remaining() < 1 {
             return;
         }
@@ -314,7 +320,7 @@ impl Mesh {
                 pong.put_slice(&from);
                 pong.put_slice(self.me.as_bytes());
                 pong.put_slice(&payload);
-                let _ = sfu.publish(topic, pong.freeze()).await;
+                let _ = sfu.publish(Lane::Control, topic, pong.freeze()).await;
             }
             b'Q' if payload.remaining() >= 80 => {
                 let to = payload.split_to(32);
@@ -413,7 +419,11 @@ async fn sfu_ping_loop(mesh: Arc<Mesh>, sfu: Arc<SfuClient>, topic: Topic) {
         ping.put_slice(mesh.me.as_bytes());
         ping.put_u64(seq);
         ping.put_u64(sent_ns);
-        if sfu.publish(topic, ping.freeze()).await.is_err() {
+        if sfu
+            .publish(Lane::Control, topic, ping.freeze())
+            .await
+            .is_err()
+        {
             return;
         }
         let mut dg = BytesMut::with_capacity(40);

@@ -1,8 +1,19 @@
 //! The service: an embedded iroh relay plus an SFU endpoint that keeps one
 //! room per topic. The SFU relays presence blobs and, for senders that pick
 //! SFU delivery, fans each published payload (and datagram) out to the rest
-//! of the room. Peers that pick mesh delivery talk over their own iroh
-//! connections, relayed through the embedded relay until they go direct.
+//! of the room or hands it to one member. Peers that pick mesh delivery talk
+//! over their own iroh connections, relayed through the embedded relay
+//! until they go direct.
+//!
+//! # Streams
+//!
+//! Each connection has one session stream (room management) plus lane
+//! streams in both directions (see [`crate::proto`]). Inbound, the session
+//! stream and every lane stream get their own reader task; outbound, the
+//! session stream, the control lane and the interactive lane each get a
+//! writer task, and bulk deliveries get a dispatcher that opens one stream
+//! per delivery. Stream priorities make the QUIC scheduler send control
+//! before interactive before bulk.
 //!
 //! # Resource bounds
 //!
@@ -11,22 +22,28 @@
 //!
 //! - **Connections.** At most `max_connections` at once; beyond that new
 //!   handshakes are refused. A connection must finish its handshake and open
-//!   its one bidirectional stream in time or it is closed. The QUIC transport
-//!   allows one bidi stream, no uni streams, and finite receive windows.
+//!   its session stream in time or it is closed. The QUIC transport allows
+//!   one bidi stream, `max_lane_streams` uni streams, and finite receive
+//!   windows.
 //! - **Inbound.** Frames are read incrementally (a peer must send bytes to
-//!   make us allocate them). PUBLISH+ANNOUNCE, room joins and datagrams each
-//!   go through a token bucket per connection.
-//! - **Outbound.** Each connection has a queue bounded in bytes. A frame is
-//!   encoded once and the same [`Bytes`] is queued for every recipient; a
-//!   DELIVER reuses the publisher's received body. A connection whose queue
-//!   goes over budget, or whose stream accepts no bytes for `stall_timeout`,
-//!   is closed, so a slow reader never holds a room back.
+//!   make us allocate them), so partly received frames take at most one
+//!   frame per open stream. PUBLISH+PUBLISH_TO+ANNOUNCE (all lanes), room
+//!   joins and datagrams each go through a token bucket per connection.
+//! - **Outbound.** A DELIVER is encoded once and the same [`Bytes`] are
+//!   queued for every recipient, sliced from the publisher's received body.
+//!   The session stream and the control and interactive lanes share one
+//!   byte budget per connection: a connection that goes over it, or whose
+//!   stream accepts no bytes for `stall_timeout`, is closed, so a slow
+//!   reader never holds a room back. Bulk has its own budget, counting
+//!   deliveries until the client acknowledges them: over it the oldest
+//!   queued bulk deliveries are dropped, and a bulk stream that makes no
+//!   progress for `stall_timeout` is reset; the connection stays.
 //! - **Rooms.** Sharded by topic. A lock is held only to update membership
 //!   and enqueue already-encoded frames (snapshots are encoded later, by the
 //!   receiving connection's writer); logging happens outside it.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     num::NonZeroU32,
     sync::{
@@ -50,25 +67,33 @@ use iroh_relay::{
         TlsConfig,
     },
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{Notify, Semaphore, mpsc},
+    task::{JoinHandle, JoinSet},
+};
 use tracing::{debug, info, warn};
 
 use crate::proto::{
-    ClientFrame, FrameLengthError, MAX_ANNOUNCE_LEN, MAX_MEMBERS_PER_TOPIC, MAX_PUBLISH_LEN,
+    ClientFrame, FrameLengthError, Lane, MAX_ANNOUNCE_LEN, MAX_MEMBERS_PER_TOPIC, MAX_PUBLISH_LEN,
     MAX_TOPICS_PER_CONNECTION, Member, SFU_ALPN, SNAPSHOT_CHUNK_BYTES, SNAPSHOT_CHUNK_ENTRIES,
-    ServerFrame, Topic, close, encode_snapshot, frame_header, read_frame, reason,
-    snapshot_wire_len, split_datagram, tag,
+    ServerFrame, Topic, close, encode_snapshot, frame_header, priority, read_frame, read_lane_byte,
+    reason, snapshot_wire_len, split_datagram, stream_error, tag,
 };
 
-const MIB: u64 = 1024 * 1024;
+const MIB: usize = 1024 * 1024;
 
 /// QUIC connection receive window: unread bytes a client may have in flight
-/// towards us across the connection.
+/// towards us across the connection. Every stream is read eagerly, so this
+/// only has to cover the bandwidth-delay product.
 const QUIC_RECEIVE_WINDOW: u32 = 4 * MIB as u32;
 /// QUIC stream receive window; above one maximal frame.
 const QUIC_STREAM_RECEIVE_WINDOW: u32 = 2 * MIB as u32;
-/// Unacknowledged bytes we keep in flight towards one client.
-const QUIC_SEND_WINDOW: u64 = 4 * MIB;
+/// Send window on top of the bulk budget. Bulk bytes count against that
+/// budget until the client acknowledges them, so bulk alone never fills the
+/// window; this headroom covers the session stream and the two long-lived
+/// lanes (each held to the client's stream window, 1.25 MB by default). With
+/// the window never full, priorities alone decide what is sent first.
+const QUIC_SEND_WINDOW_HEADROOM: usize = 8 * MIB;
 /// Received datagrams buffered per connection before QUIC drops them.
 const QUIC_DATAGRAM_RECEIVE_BUFFER: usize = 512 * 1024;
 /// Room shards; topics are uniformly random, so any byte picks a shard.
@@ -111,14 +136,27 @@ pub struct Limits {
     pub max_connections: usize,
     /// Time a connection has to finish its QUIC handshake.
     pub handshake_timeout: Duration,
-    /// Time a connection has to open its bidirectional stream.
+    /// Time a connection has to open its session stream.
     pub stream_open_timeout: Duration,
-    /// Bytes queued towards one connection before it is closed as a slow
-    /// consumer. An empty queue always takes one frame.
+    /// Lane streams a client may have open at once: its control and
+    /// interactive lanes plus concurrent bulk publishes. Each holds at most
+    /// one partly received frame, so this × [`crate::proto::MAX_FRAME_LEN`]
+    /// bounds what a connection's lane readers buffer.
+    pub max_lane_streams: u32,
+    /// Bytes queued towards one connection on its session stream and its
+    /// control and interactive lanes before it is closed as a slow consumer.
+    /// An empty budget always takes one frame.
     pub outbox_bytes: usize,
-    /// Time the stream may accept no bytes before the connection is closed.
+    /// Bulk bytes queued or unacknowledged towards one connection. A bulk
+    /// delivery that does not fit drops the oldest queued ones (or itself).
+    pub bulk_outbox_bytes: usize,
+    /// Bulk streams the SFU has open towards one connection at once; more
+    /// bulk deliveries wait in the queue.
+    pub max_bulk_streams: usize,
+    /// Time a stream may accept no bytes before its connection is closed
+    /// (session, control, interactive) or it is reset (bulk).
     pub stall_timeout: Duration,
-    /// PUBLISH and ANNOUNCE a connection may send.
+    /// PUBLISH, PUBLISH_TO (every lane) and ANNOUNCE a connection may send.
     pub publish_rate: Rate,
     /// Room joins (SUBSCRIBE) a connection may make. Each join costs the
     /// room a JOINED, so this bounds subscribe/unsubscribe churn.
@@ -137,10 +175,16 @@ impl Default for Limits {
             max_connections: 10_000,
             handshake_timeout: Duration::from_secs(15),
             stream_open_timeout: Duration::from_secs(10),
-            outbox_bytes: 8 * MIB as usize,
+            // Two long-lived lanes plus 14 bulk uploads in flight, far more
+            // than the publish burst lets through anyway.
+            max_lane_streams: 16,
+            outbox_bytes: 8 * MIB,
+            bulk_outbox_bytes: 8 * MIB,
+            max_bulk_streams: 16,
             stall_timeout: Duration::from_secs(20),
-            // The burst is half the outbox budget, so one publisher's burst
-            // alone cannot push a healthy reader over it.
+            // The burst is half the disconnecting outbox budget, so one
+            // publisher's burst alone cannot push a healthy reader over it,
+            // even on the interactive lane.
             publish_rate: Rate {
                 bytes_per_second: (4 * MIB) as f64,
                 burst_bytes: (4 * MIB) as f64,
@@ -210,24 +254,40 @@ pub struct Sfu {
     accept_task: JoinHandle<()>,
 }
 
-/// Counters since start (and two gauges), for logs and diagnostics.
+/// Counters since start (and one gauge), for logs and diagnostics.
 #[derive(Default, Debug)]
 pub struct Stats {
     /// Open connections right now, including handshakes in progress.
     pub connections: AtomicU64,
     /// Connections refused at the connection cap.
     pub connections_refused: AtomicU64,
-    /// Connections closed for not opening their stream in time.
+    /// Connections closed for not opening their session stream in time.
     pub no_stream: AtomicU64,
-    /// Connections closed because their outbound queue went over budget.
+    /// Connections closed because their session/control/interactive queue
+    /// went over budget.
     pub slow_consumers: AtomicU64,
-    /// Connections closed because their stream stopped accepting bytes.
+    /// Connections closed because their session, control or interactive
+    /// stream stopped accepting bytes.
     pub stalled: AtomicU64,
-    pub published: AtomicU64,
-    pub delivered: AtomicU64,
-    /// PUBLISH/ANNOUNCE/SUBSCRIBE refused by a rate limit.
+    /// Accepted PUBLISH and PUBLISH_TO, per lane ([`Lane::index`]).
+    pub published: [AtomicU64; 3],
+    /// DELIVERs queued, per lane.
+    pub delivered: [AtomicU64; 3],
+    /// Accepted PUBLISH_TO (also counted in `published`).
+    pub directed: AtomicU64,
+    /// Bulk deliveries dropped because the receiver's bulk budget was full.
+    pub bulk_dropped: AtomicU64,
+    /// Bulk streams reset (or never opened) for making no progress.
+    pub bulk_stalled: AtomicU64,
+    /// Client streams stopped because their first byte is not a lane.
+    pub bad_lanes: AtomicU64,
+    /// Client bulk streams stopped for data after their frame or a
+    /// malformed frame.
+    pub bulk_stopped: AtomicU64,
+    /// PUBLISH/PUBLISH_TO/ANNOUNCE/SUBSCRIBE refused by a rate limit.
     pub rate_limited: AtomicU64,
-    /// Client frames skipped for an unknown tag or a malformed body.
+    /// Client frames skipped (or bulk streams stopped) for an unknown tag,
+    /// a malformed body, or a frame on the wrong kind of stream.
     pub malformed: AtomicU64,
     pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
@@ -244,19 +304,51 @@ impl Stats {
     /// The current values, for logging.
     pub fn snapshot(&self) -> StatsSnapshot {
         let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let lanes = |counters: &[AtomicU64; 3]| LaneCounts {
+            control: get(&counters[Lane::Control.index()]),
+            interactive: get(&counters[Lane::Interactive.index()]),
+            bulk: get(&counters[Lane::Bulk.index()]),
+        };
         StatsSnapshot {
             connections: get(&self.connections),
             connections_refused: get(&self.connections_refused),
             no_stream: get(&self.no_stream),
             slow_consumers: get(&self.slow_consumers),
             stalled: get(&self.stalled),
-            published: get(&self.published),
-            delivered: get(&self.delivered),
+            published: lanes(&self.published),
+            delivered: lanes(&self.delivered),
+            directed: get(&self.directed),
+            bulk_dropped: get(&self.bulk_dropped),
+            bulk_stalled: get(&self.bulk_stalled),
+            bad_lanes: get(&self.bad_lanes),
+            bulk_stopped: get(&self.bulk_stopped),
             rate_limited: get(&self.rate_limited),
             malformed: get(&self.malformed),
             datagrams_in: get(&self.datagrams_in),
             datagrams_out: get(&self.datagrams_out),
             datagrams_dropped: get(&self.datagrams_dropped),
+        }
+    }
+}
+
+/// A counter per lane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaneCounts {
+    pub control: u64,
+    pub interactive: u64,
+    pub bulk: u64,
+}
+
+impl LaneCounts {
+    pub fn total(&self) -> u64 {
+        self.control + self.interactive + self.bulk
+    }
+
+    pub fn get(&self, lane: Lane) -> u64 {
+        match lane {
+            Lane::Control => self.control,
+            Lane::Interactive => self.interactive,
+            Lane::Bulk => self.bulk,
         }
     }
 }
@@ -269,8 +361,13 @@ pub struct StatsSnapshot {
     pub no_stream: u64,
     pub slow_consumers: u64,
     pub stalled: u64,
-    pub published: u64,
-    pub delivered: u64,
+    pub published: LaneCounts,
+    pub delivered: LaneCounts,
+    pub directed: u64,
+    pub bulk_dropped: u64,
+    pub bulk_stalled: u64,
+    pub bad_lanes: u64,
+    pub bulk_stopped: u64,
     pub rate_limited: u64,
     pub malformed: u64,
     pub datagrams_in: u64,
@@ -315,12 +412,13 @@ impl Sfu {
         let relay_map: RelayMap =
             iroh::RelayConfig::new(relay_url.clone(), quic_port.map(RelayQuicConfig::new)).into();
 
+        let limits = &config.limits;
         let transport = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(VarInt::from_u32(1))
-            .max_concurrent_uni_streams(VarInt::from_u32(0))
+            .max_concurrent_uni_streams(VarInt::from_u32(limits.max_lane_streams))
             .receive_window(VarInt::from_u32(QUIC_RECEIVE_WINDOW))
             .stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW))
-            .send_window(QUIC_SEND_WINDOW)
+            .send_window((limits.bulk_outbox_bytes + QUIC_SEND_WINDOW_HEADROOM) as u64)
             .datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER))
             .build();
         let mut endpoint = Endpoint::builder(presets::Minimal)
@@ -480,42 +578,75 @@ async fn serve_connection(conn: Connection, shared: &Arc<Shared>) {
                 return debug!(peer = %peer.fmt_short(), "closed: no stream opened");
             }
         };
-    debug!(peer = %peer.fmt_short(), conn_id, "sfu stream open");
+    let _ = send.set_priority(priority::SESSION);
+    debug!(peer = %peer.fmt_short(), conn_id, "sfu session open");
 
-    let (tx, rx) = mpsc::unbounded_channel();
-    let outbox = Arc::new(Outbox {
+    let budget = Arc::new(Budget {
         queued: AtomicUsize::new(0),
-        budget: limits.outbox_bytes,
+        limit: limits.outbox_bytes,
         overflowed: AtomicBool::new(false),
     });
-    let mut writer = tokio::spawn(write_loop(
+    let bulk = Arc::new(BulkQueue::new(limits.bulk_outbox_bytes));
+    let (session_tx, session_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (interactive_tx, interactive_rx) = mpsc::unbounded_channel();
+    let mut writers = JoinSet::new();
+    writers.spawn(session_writer(
         send,
-        rx,
-        outbox.clone(),
+        session_rx,
+        budget.clone(),
         conn.clone(),
         shared.clone(),
     ));
+    writers.spawn(lane_writer(
+        Lane::Control,
+        control_rx,
+        budget.clone(),
+        conn.clone(),
+        shared.clone(),
+    ));
+    writers.spawn(lane_writer(
+        Lane::Interactive,
+        interactive_rx,
+        budget.clone(),
+        conn.clone(),
+        shared.clone(),
+    ));
+    writers.spawn(bulk_dispatcher(bulk.clone(), conn.clone(), shared.clone()));
+
     let handle = MemberHandle {
         peer,
         conn_id,
-        tx,
-        outbox: outbox.clone(),
+        out: Arc::new(Outbound {
+            budget: budget.clone(),
+            session: session_tx,
+            lanes: [control_tx, interactive_tx],
+            bulk,
+            stats: stats.clone(),
+        }),
         conn: conn.clone(),
     };
     let datagrams = tokio::spawn(datagram_loop(handle.clone(), shared.clone()));
-    let mut session = Session {
+    let readers = Arc::new(Readers {
         handle,
-        shared,
+        shared: shared.clone(),
+        publish_rate: Mutex::new(Bucket::new(limits.publish_rate)),
+    });
+    let lanes = tokio::spawn(accept_lanes(conn.clone(), readers.clone()));
+    let mut session = Session {
+        readers,
         subscribed: HashSet::new(),
-        publish_rate: Bucket::new(limits.publish_rate),
         join_rate: Bucket::new(limits.join_rate),
     };
     let result = session.read_loop(&mut recv).await;
 
     datagrams.abort();
+    lanes.abort();
     let _ = datagrams.await;
+    let _ = lanes.await;
     session.leave_all();
-    // Every queue handle is gone now, so the writer drains and finishes.
+    // Every queue handle is gone now (the lane readers went with their
+    // acceptor), so the writers drain and finish.
     drop(session);
     match &result {
         Err(err) if err.downcast_ref::<FrameLengthError>().is_some() => {
@@ -524,13 +655,14 @@ async fn serve_connection(conn: Connection, shared: &Arc<Shared>) {
         }
         _ => {}
     }
-    if tokio::time::timeout(limits.stall_timeout, &mut writer)
-        .await
-        .is_err()
-    {
-        writer.abort();
+    let drained = tokio::time::timeout(limits.stall_timeout, async {
+        while writers.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        writers.abort_all();
     }
-    if outbox.overflowed.load(Ordering::Acquire) {
+    if budget.overflowed.load(Ordering::Acquire) {
         Stats::bump(&stats.slow_consumers);
         warn!(peer = %peer.fmt_short(), conn_id, "dropped a slow consumer (outbox over budget)");
     }
@@ -540,39 +672,106 @@ async fn serve_connection(conn: Connection, shared: &Arc<Shared>) {
     }
 }
 
-/// One connection's view: what it subscribed to and its rate budgets.
-struct Session<'a> {
+/// What every reader of one connection shares: the queues towards it and
+/// the publish budget, which spans the session stream (ANNOUNCE) and every
+/// lane (PUBLISH, PUBLISH_TO).
+struct Readers {
     handle: MemberHandle,
-    shared: &'a Shared,
+    shared: Arc<Shared>,
+    publish_rate: Mutex<Bucket>,
+}
+
+impl Readers {
+    fn take_publish(&self, frame_len: usize) -> bool {
+        self.publish_rate
+            .lock()
+            .expect("publish rate lock")
+            .try_take(frame_len)
+    }
+
+    fn rate_limited(&self, topic: Topic) {
+        Stats::bump(&self.shared.stats.rate_limited);
+        self.handle.error(Some(topic), reason::RATE_LIMITED);
+    }
+
+    /// Answers a frame that could not be decoded (or does not belong on its
+    /// stream) with a general ERROR; the stream carries on.
+    fn skip_malformed(&self, tag: u8, err: &anyhow::Error) {
+        Stats::bump(&self.shared.stats.malformed);
+        debug!(peer = %self.handle.peer.fmt_short(), "skipping client frame 0x{tag:02x}: {err:#}");
+        self.handle
+            .error(None, format!("malformed frame 0x{tag:02x}: {err:#}"));
+    }
+
+    /// A PUBLISH or PUBLISH_TO from a lane stream. `topic` is the first 32
+    /// bytes of the frame body, kept to build the DELIVER without copying.
+    fn publish(&self, lane: Lane, frame: ClientFrame, topic_bytes: Bytes, frame_len: usize) {
+        let (topic, recipient, payload) = match frame {
+            ClientFrame::Publish { topic, payload } => (topic, None, payload),
+            ClientFrame::PublishTo {
+                topic,
+                recipient,
+                payload,
+            } => (topic, Some(recipient), payload),
+            _ => unreachable!("only lane frames are published"),
+        };
+        let (rooms, stats, handle) = (&self.shared.rooms, &self.shared.stats, &self.handle);
+        if payload.len() > MAX_PUBLISH_LEN {
+            return handle.error(Some(topic), reason::PUBLISH_TOO_LARGE);
+        }
+        if !rooms.is_member(topic, handle) {
+            return handle.error(Some(topic), reason::NOT_SUBSCRIBED);
+        }
+        if !self.take_publish(frame_len) {
+            return self.rate_limited(topic);
+        }
+        let deliver = Deliver::new(topic_bytes, payload);
+        let result = match recipient {
+            None => rooms.publish(topic, handle, lane, &deliver),
+            Some(recipient) => rooms.publish_to(topic, handle, recipient, lane, &deliver),
+        };
+        match result {
+            Ok(fanout) => {
+                Stats::bump(&stats.published[lane.index()]);
+                stats.delivered[lane.index()].fetch_add(fanout as u64, Ordering::Relaxed);
+                if recipient.is_some() {
+                    Stats::bump(&stats.directed);
+                }
+            }
+            Err(Refusal::NotSubscribed) => handle.error(Some(topic), reason::NOT_SUBSCRIBED),
+            Err(Refusal::NoSuchRecipient) => handle.error(Some(topic), reason::NO_SUCH_RECIPIENT),
+        }
+    }
+}
+
+/// The session stream's reader: subscriptions and presence.
+struct Session {
+    readers: Arc<Readers>,
     subscribed: HashSet<Topic>,
-    publish_rate: Bucket,
     join_rate: Bucket,
 }
 
-impl Session<'_> {
+impl Session {
     async fn read_loop(&mut self, recv: &mut RecvStream) -> Result<()> {
         while let Some((tag, body)) = read_frame(recv).await? {
             let frame_len = 5 + body.len();
-            // PUBLISH's body is `topic ‖ payload`, exactly DELIVER's body:
-            // keep it to forward without copying.
-            let raw = body.clone();
             match ClientFrame::decode(tag, body) {
-                Ok(frame) => self.handle_frame(frame, raw, frame_len),
-                Err(err) => {
-                    // Skip it; the stream is still in sync.
-                    Stats::bump(&self.shared.stats.malformed);
-                    debug!(peer = %self.handle.peer.fmt_short(), "skipping client frame 0x{tag:02x}: {err:#}");
-                    self.handle
-                        .error(None, format!("malformed frame 0x{tag:02x}: {err:#}"));
-                }
+                Ok(frame) => self.handle_frame(frame, frame_len),
+                // Skip it; the stream is still in sync.
+                Err(err) => self.readers.skip_malformed(tag, &err),
             }
         }
         Ok(())
     }
 
-    fn handle_frame(&mut self, frame: ClientFrame, raw: Bytes, frame_len: usize) {
-        let (rooms, stats, limits) = (&self.shared.rooms, &self.shared.stats, &self.shared.limits);
-        let handle = &self.handle;
+    fn handle_frame(&mut self, frame: ClientFrame, frame_len: usize) {
+        let readers = &*self.readers;
+        let (rooms, stats, limits) = (
+            &readers.shared.rooms,
+            &readers.shared.stats,
+            &readers.shared.limits,
+        );
+        let handle = &readers.handle;
         match frame {
             ClientFrame::Subscribe { topic } => {
                 if self.subscribed.contains(&topic) {
@@ -606,35 +805,106 @@ impl Session<'_> {
                     handle.error(Some(topic), reason::ANNOUNCE_TOO_LARGE);
                 } else if !self.subscribed.contains(&topic) {
                     handle.error(Some(topic), reason::NOT_SUBSCRIBED);
-                } else if !self.publish_rate.try_take(frame_len) {
-                    Stats::bump(&stats.rate_limited);
-                    handle.error(Some(topic), reason::RATE_LIMITED);
+                } else if !readers.take_publish(frame_len) {
+                    readers.rate_limited(topic);
                 } else if rooms.announce(topic, handle, blob) {
                     debug!(topic = %topic.fmt_short(), peer = %handle.peer.fmt_short(), "announced");
                 }
             }
-            ClientFrame::Publish { topic, payload } => {
-                if payload.len() > MAX_PUBLISH_LEN {
-                    handle.error(Some(topic), reason::PUBLISH_TOO_LARGE);
-                } else if !self.subscribed.contains(&topic) {
-                    handle.error(Some(topic), reason::NOT_SUBSCRIBED);
-                } else if !self.publish_rate.try_take(frame_len) {
-                    Stats::bump(&stats.rate_limited);
-                    handle.error(Some(topic), reason::RATE_LIMITED);
-                } else {
-                    let fanout = rooms.publish(topic, handle, raw);
-                    Stats::bump(&stats.published);
-                    stats.delivered.fetch_add(fanout as u64, Ordering::Relaxed);
-                }
+            ClientFrame::Publish { topic, .. } | ClientFrame::PublishTo { topic, .. } => {
+                handle.error(Some(topic), reason::PUBLISH_ON_SESSION);
             }
         }
     }
 
     fn leave_all(&mut self) {
         for topic in self.subscribed.drain() {
-            self.shared.rooms.leave(topic, &self.handle);
+            self.readers.shared.rooms.leave(topic, &self.readers.handle);
         }
     }
+}
+
+/// Accepts the client's lane streams, one reader task each, until the
+/// connection ends. Aborting it aborts every reader.
+async fn accept_lanes(conn: Connection, readers: Arc<Readers>) {
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = conn.accept_uni() => {
+                let Ok(recv) = accepted else { break };
+                let readers = readers.clone();
+                tasks.spawn(async move {
+                    if let Err(err) = read_lane(recv, &readers).await {
+                        if err.downcast_ref::<FrameLengthError>().is_some() {
+                            readers
+                                .handle
+                                .conn
+                                .close(close::PROTOCOL.into(), err.to_string().as_bytes());
+                        }
+                        debug!(peer = %readers.handle.peer.fmt_short(), "lane stream ended: {err:#}");
+                    }
+                });
+            }
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+        }
+    }
+}
+
+/// Reads one client lane stream: its lane byte, then PUBLISH/PUBLISH_TO
+/// frames (exactly one on a bulk stream). A bad length prefix is returned
+/// as a [`FrameLengthError`]; everything else ends the stream quietly.
+async fn read_lane(mut recv: RecvStream, readers: &Readers) -> Result<()> {
+    let stats = &readers.shared.stats;
+    let peer = readers.handle.peer.fmt_short();
+    let Some(byte) = read_lane_byte(&mut recv).await? else {
+        return Ok(());
+    };
+    let Some(lane) = Lane::from_byte(byte) else {
+        Stats::bump(&stats.bad_lanes);
+        let _ = recv.stop(stream_error::UNKNOWN_LANE.into());
+        debug!(%peer, "stopped a stream with unknown lane 0x{byte:02x}");
+        return Ok(());
+    };
+    if lane == Lane::Bulk {
+        let Some((tag, body)) = read_frame(&mut recv).await? else {
+            return Ok(());
+        };
+        let frame_len = 5 + body.len();
+        match decode_lane_frame(tag, body) {
+            Ok((frame, topic)) => readers.publish(lane, frame, topic, frame_len),
+            Err(err) => {
+                Stats::bump(&stats.malformed);
+                Stats::bump(&stats.bulk_stopped);
+                let _ = recv.stop(stream_error::MALFORMED.into());
+                debug!(%peer, "stopped a bulk stream: frame 0x{tag:02x}: {err:#}");
+                return Ok(());
+            }
+        }
+        // One frame per bulk stream: the next thing must be its end.
+        if let Ok(Some(_)) = recv.read(&mut [0u8; 1]).await {
+            Stats::bump(&stats.bulk_stopped);
+            let _ = recv.stop(stream_error::BULK_TRAILING.into());
+            debug!(%peer, "stopped a bulk stream with data after its frame");
+        }
+        return Ok(());
+    }
+    while let Some((tag, body)) = read_frame(&mut recv).await? {
+        let frame_len = 5 + body.len();
+        match decode_lane_frame(tag, body) {
+            Ok((frame, topic)) => readers.publish(lane, frame, topic, frame_len),
+            Err(err) => readers.skip_malformed(tag, &err),
+        }
+    }
+    Ok(())
+}
+
+/// Decodes a lane frame and also returns the body's topic bytes (a slice of
+/// the received buffer, which the DELIVER reuses).
+fn decode_lane_frame(tag: u8, body: Bytes) -> Result<(ClientFrame, Bytes)> {
+    let topic = body.slice(..body.len().min(32));
+    let frame = ClientFrame::decode(tag, body)?;
+    anyhow::ensure!(frame.is_lane_frame(), "not a lane frame");
+    Ok((frame, topic))
 }
 
 /// Forwards each `topic ‖ payload` datagram to the topic's other
@@ -663,27 +933,170 @@ async fn datagram_loop(handle: MemberHandle, shared: Arc<Shared>) {
     }
 }
 
-/// Something queued towards one client.
-enum Outgoing {
+/// A DELIVER frame, encoded once and shared by every recipient: a fresh
+/// header plus the topic and payload sliced from the publisher's received
+/// body.
+#[derive(Clone)]
+struct Deliver {
+    head: Bytes,
+    topic: Bytes,
+    payload: Bytes,
+}
+
+impl Deliver {
+    fn new(topic: Bytes, payload: Bytes) -> Self {
+        debug_assert_eq!(topic.len(), 32);
+        Self {
+            head: frame_header(tag::DELIVER, topic.len() + payload.len()),
+            topic,
+            payload,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.head.len() + self.topic.len() + self.payload.len()
+    }
+
+    fn chunks(&self) -> [Bytes; 3] {
+        [self.head.clone(), self.topic.clone(), self.payload.clone()]
+    }
+}
+
+/// Something queued on the session stream.
+enum SessionItem {
     /// An encoded frame, shared with every other recipient.
     Frame(Bytes),
-    /// A frame as header plus a body shared with the sender's read buffer.
-    Parts(Bytes, Bytes),
     /// A room snapshot, encoded into chunks by the writer.
     Snapshot { topic: Topic, members: Vec<Member> },
 }
 
-struct Queued {
-    item: Outgoing,
+struct Queued<T> {
+    item: T,
     /// What the item counts against the byte budget.
     size: usize,
 }
 
-/// Byte accounting for one connection's queue.
-struct Outbox {
+/// Byte accounting for the queues that drop a slow consumer: the session
+/// stream and the control and interactive lanes.
+struct Budget {
     queued: AtomicUsize,
-    budget: usize,
+    limit: usize,
     overflowed: AtomicBool,
+}
+
+impl Budget {
+    fn release(&self, size: usize) {
+        self.queued.fetch_sub(size, Ordering::AcqRel);
+    }
+}
+
+/// Bulk deliveries waiting for a stream, plus the accounting for those on
+/// a stream and not yet acknowledged.
+struct BulkQueue {
+    state: Mutex<BulkState>,
+    budget: usize,
+    ready: Notify,
+}
+
+#[derive(Default)]
+struct BulkState {
+    waiting: VecDeque<Deliver>,
+    /// Bytes in `waiting`.
+    waiting_bytes: usize,
+    /// Bytes in `waiting` plus bytes on streams not yet acknowledged.
+    bytes: usize,
+    closed: bool,
+}
+
+impl BulkQueue {
+    fn new(budget: usize) -> Self {
+        Self {
+            state: Mutex::default(),
+            budget,
+            ready: Notify::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BulkState> {
+        self.state.lock().expect("bulk queue lock")
+    }
+
+    /// Queues a delivery within the budget, dropping the oldest waiting ones
+    /// to make room, or this one if the deliveries already on streams leave
+    /// no room. An empty budget always takes one. Returns how many
+    /// deliveries were dropped. Never logs: callers may hold a room lock.
+    fn push(&self, frame: Deliver) -> u64 {
+        let size = frame.len();
+        let mut state = self.lock();
+        if state.closed {
+            return 0;
+        }
+        let on_streams = state.bytes - state.waiting_bytes;
+        if on_streams > 0 && on_streams + size > self.budget {
+            return 1;
+        }
+        let mut dropped = 0;
+        while state.bytes > 0 && state.bytes + size > self.budget {
+            let Some(oldest) = state.waiting.pop_front() else {
+                break;
+            };
+            state.waiting_bytes -= oldest.len();
+            state.bytes -= oldest.len();
+            dropped += 1;
+        }
+        state.waiting.push_back(frame);
+        state.waiting_bytes += size;
+        state.bytes += size;
+        drop(state);
+        self.ready.notify_one();
+        dropped
+    }
+
+    /// The oldest waiting delivery, moved onto a stream (it keeps counting
+    /// until [`Self::done`]). `None` once closed and empty.
+    async fn next(&self) -> Option<Deliver> {
+        loop {
+            let ready = self.ready.notified();
+            {
+                let mut state = self.lock();
+                if let Some(frame) = state.waiting.pop_front() {
+                    state.waiting_bytes -= frame.len();
+                    return Some(frame);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            ready.await;
+        }
+    }
+
+    /// A delivery left its stream (acknowledged, reset or failed).
+    fn done(&self, size: usize) {
+        self.lock().bytes -= size;
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+        self.ready.notify_one();
+    }
+}
+
+/// The queues towards one client. Dropping the last handle closes them, so
+/// the writers drain and finish.
+struct Outbound {
+    budget: Arc<Budget>,
+    session: mpsc::UnboundedSender<Queued<SessionItem>>,
+    /// Control, then interactive.
+    lanes: [mpsc::UnboundedSender<Queued<Deliver>>; 2],
+    bulk: Arc<BulkQueue>,
+    stats: Arc<Stats>,
+}
+
+impl Drop for Outbound {
+    fn drop(&mut self) {
+        self.bulk.close();
+    }
 }
 
 /// The sending half of one client connection, as rooms hold it.
@@ -691,37 +1104,65 @@ struct Outbox {
 struct MemberHandle {
     peer: EndpointId,
     conn_id: u64,
-    tx: mpsc::UnboundedSender<Queued>,
-    outbox: Arc<Outbox>,
+    out: Arc<Outbound>,
     conn: Connection,
 }
 
 impl MemberHandle {
-    /// Queues an item without blocking. A client whose queue goes over its
-    /// byte budget is disconnected rather than allowed to stall the room.
-    /// Never logs: callers may hold a room lock.
-    fn push(&self, item: Outgoing, size: usize) {
-        let outbox = &*self.outbox;
-        if outbox.overflowed.load(Ordering::Acquire) {
-            return;
+    /// Counts `size` bytes against the session/control/interactive budget.
+    /// A client that would go over it is disconnected rather than allowed to
+    /// stall the room. Never logs: callers may hold a room lock.
+    fn reserve(&self, size: usize) -> bool {
+        let budget = &*self.out.budget;
+        if budget.overflowed.load(Ordering::Acquire) {
+            return false;
         }
-        let before = outbox.queued.fetch_add(size, Ordering::AcqRel);
-        if before > 0 && before + size > outbox.budget {
-            outbox.queued.fetch_sub(size, Ordering::AcqRel);
-            if !outbox.overflowed.swap(true, Ordering::AcqRel) {
+        let before = budget.queued.fetch_add(size, Ordering::AcqRel);
+        if before > 0 && before + size > budget.limit {
+            budget.release(size);
+            if !budget.overflowed.swap(true, Ordering::AcqRel) {
                 self.conn
                     .close(close::SLOW_CONSUMER.into(), b"slow consumer");
             }
-            return;
+            return false;
         }
-        if self.tx.send(Queued { item, size }).is_err() {
-            outbox.queued.fetch_sub(size, Ordering::AcqRel);
+        true
+    }
+
+    fn push_session(&self, item: SessionItem, size: usize) {
+        if self.reserve(size) && self.out.session.send(Queued { item, size }).is_err() {
+            self.out.budget.release(size);
         }
     }
 
     fn push_frame(&self, frame: Bytes) {
         let size = frame.len();
-        self.push(Outgoing::Frame(frame), size);
+        self.push_session(SessionItem::Frame(frame), size);
+    }
+
+    /// Queues a DELIVER on `lane`. Never logs: callers hold a room lock.
+    fn deliver(&self, lane: Lane, frame: &Deliver) {
+        match lane {
+            Lane::Bulk => {
+                let dropped = self.out.bulk.push(frame.clone());
+                if dropped > 0 {
+                    self.out
+                        .stats
+                        .bulk_dropped
+                        .fetch_add(dropped, Ordering::Relaxed);
+                }
+            }
+            Lane::Control | Lane::Interactive => {
+                let size = frame.len();
+                let item = Queued {
+                    item: frame.clone(),
+                    size,
+                };
+                if self.reserve(size) && self.out.lanes[lane.index()].send(item).is_err() {
+                    self.out.budget.release(size);
+                }
+            }
+        }
     }
 
     fn error(&self, topic: Option<Topic>, reason: impl Into<String>) {
@@ -735,21 +1176,20 @@ impl MemberHandle {
     }
 }
 
-/// Writes queued items to the stream until every queue handle is gone. A
-/// write that makes no progress for `stall_timeout` closes the connection.
-async fn write_loop(
+/// Writes the session stream until every queue handle is gone. A write that
+/// makes no progress for `stall_timeout` closes the connection.
+async fn session_writer(
     mut send: SendStream,
-    mut rx: mpsc::UnboundedReceiver<Queued>,
-    outbox: Arc<Outbox>,
+    mut rx: mpsc::UnboundedReceiver<Queued<SessionItem>>,
+    budget: Arc<Budget>,
     conn: Connection,
     shared: Arc<Shared>,
 ) {
     let limits = &shared.limits;
     while let Some(Queued { item, size }) = rx.recv().await {
         let written = match item {
-            Outgoing::Frame(frame) => write_chunks(&mut send, &mut [frame], limits).await,
-            Outgoing::Parts(head, body) => write_chunks(&mut send, &mut [head, body], limits).await,
-            Outgoing::Snapshot { topic, members } => {
+            SessionItem::Frame(frame) => write_chunks(&mut send, &mut [frame], limits).await,
+            SessionItem::Snapshot { topic, members } => {
                 let mut chunks = encode_snapshot(
                     topic,
                     &members,
@@ -760,19 +1200,140 @@ async fn write_loop(
                 write_chunks(&mut send, &mut chunks, limits).await
             }
         };
-        outbox.queued.fetch_sub(size, Ordering::AcqRel);
+        budget.release(size);
         match written {
             Ok(()) => {}
             Err(WriteFailure::Closed) => return,
-            Err(WriteFailure::Stalled) => {
-                Stats::bump(&shared.stats.stalled);
-                conn.close(close::STALLED.into(), b"stalled");
-                warn!(peer = %conn.remote_id().fmt_short(), "dropped a stalled consumer (no write progress)");
-                return;
-            }
+            Err(WriteFailure::Stalled) => return stalled(&conn, &shared, "session"),
         }
     }
     let _ = send.finish();
+}
+
+/// Writes one long-lived lane (control or interactive) towards the client,
+/// opening its stream on the first DELIVER. A write that makes no progress
+/// for `stall_timeout` closes the connection; a stream the client stopped
+/// is replaced on the next DELIVER.
+async fn lane_writer(
+    lane: Lane,
+    mut rx: mpsc::UnboundedReceiver<Queued<Deliver>>,
+    budget: Arc<Budget>,
+    conn: Connection,
+    shared: Arc<Shared>,
+) {
+    let limits = &shared.limits;
+    let mut stream: Option<SendStream> = None;
+    while let Some(Queued { item, size }) = rx.recv().await {
+        let [head, topic, payload] = item.chunks();
+        let written = match stream.as_mut() {
+            Some(send) => write_chunks(send, &mut [head, topic, payload], limits).await,
+            None => match open_lane(&conn, lane, limits).await {
+                Ok(mut send) => {
+                    let written = write_chunks(
+                        &mut send,
+                        &mut [lane.prefix(), head, topic, payload],
+                        limits,
+                    )
+                    .await;
+                    stream = Some(send);
+                    written
+                }
+                Err(failure) => Err(failure),
+            },
+        };
+        budget.release(size);
+        match written {
+            Ok(()) => {}
+            Err(WriteFailure::Closed) if conn.close_reason().is_none() => stream = None,
+            Err(WriteFailure::Closed) => return,
+            Err(WriteFailure::Stalled) => return stalled(&conn, &shared, lane.name()),
+        }
+    }
+    if let Some(mut send) = stream {
+        let _ = send.finish();
+    }
+}
+
+fn stalled(conn: &Connection, shared: &Shared, stream: &str) {
+    Stats::bump(&shared.stats.stalled);
+    conn.close(close::STALLED.into(), b"stalled");
+    warn!(peer = %conn.remote_id().fmt_short(), stream, "dropped a stalled consumer (no write progress)");
+}
+
+/// Opens a server → client lane stream at the lane's priority. Waiting for
+/// stream credit counts as a stall.
+async fn open_lane(
+    conn: &Connection,
+    lane: Lane,
+    limits: &Limits,
+) -> Result<SendStream, WriteFailure> {
+    let send = match tokio::time::timeout(limits.stall_timeout, conn.open_uni()).await {
+        Ok(Ok(send)) => send,
+        Ok(Err(_)) => return Err(WriteFailure::Closed),
+        Err(_) => return Err(WriteFailure::Stalled),
+    };
+    let _ = send.set_priority(lane.priority());
+    Ok(send)
+}
+
+/// Sends queued bulk deliveries, each on its own stream, at most
+/// `max_bulk_streams` at a time, until the queue closes and drains.
+async fn bulk_dispatcher(queue: Arc<BulkQueue>, conn: Connection, shared: Arc<Shared>) {
+    let slots = Arc::new(Semaphore::new(shared.limits.max_bulk_streams.max(1)));
+    let mut streams = JoinSet::new();
+    loop {
+        // Take a delivery off the queue only once a stream slot is free, so
+        // waiting deliveries stay droppable.
+        let Ok(slot) = slots.clone().acquire_owned().await else {
+            break;
+        };
+        let Some(frame) = queue.next().await else {
+            break;
+        };
+        let (queue, conn, shared) = (queue.clone(), conn.clone(), shared.clone());
+        streams.spawn(async move {
+            let size = frame.len();
+            send_bulk(&conn, frame, &shared).await;
+            queue.done(size);
+            drop(slot);
+        });
+        while streams.try_join_next().is_some() {}
+    }
+    while streams.join_next().await.is_some() {}
+}
+
+/// One bulk delivery: a new stream, the lane byte, one DELIVER, FIN, then
+/// the client's acknowledgement. A stream that makes no progress for
+/// `stall_timeout` (writing or waiting for the acknowledgement) is reset.
+async fn send_bulk(conn: &Connection, frame: Deliver, shared: &Shared) {
+    let limits = &shared.limits;
+    let stats = &shared.stats;
+    let mut send = match open_lane(conn, Lane::Bulk, limits).await {
+        Ok(send) => send,
+        Err(WriteFailure::Closed) => return,
+        Err(WriteFailure::Stalled) => return Stats::bump(&stats.bulk_stalled),
+    };
+    let [head, topic, payload] = frame.chunks();
+    let mut chunks = [Lane::Bulk.prefix(), head, topic, payload];
+    match write_chunks(&mut send, &mut chunks, limits).await {
+        Ok(()) => {}
+        Err(WriteFailure::Closed) => return,
+        Err(WriteFailure::Stalled) => {
+            Stats::bump(&stats.bulk_stalled);
+            let _ = send.reset(stream_error::STALLED.into());
+            return debug!(peer = %conn.remote_id().fmt_short(), "reset a stalled bulk stream");
+        }
+    }
+    let _ = send.finish();
+    // Resolves once the client has every byte (or stopped the stream).
+    if tokio::time::timeout(limits.stall_timeout, send.stopped())
+        .await
+        .is_err()
+    {
+        Stats::bump(&stats.bulk_stalled);
+        let _ = send.reset(stream_error::STALLED.into());
+        debug!(peer = %conn.remote_id().fmt_short(), "reset an unacknowledged bulk stream");
+    }
 }
 
 enum WriteFailure {
@@ -786,7 +1347,14 @@ async fn write_chunks(
     limits: &Limits,
 ) -> Result<(), WriteFailure> {
     let mut rest = chunks;
-    while !rest.is_empty() {
+    loop {
+        // An empty chunk needs no write (and must not wait for window).
+        while rest.first().is_some_and(Bytes::is_empty) {
+            rest = &mut rest[1..];
+        }
+        if rest.is_empty() {
+            return Ok(());
+        }
         // Cancel-safe: on timeout nothing more was written.
         match tokio::time::timeout(limits.stall_timeout, send.write_many_chunks(&mut rest)).await {
             Ok(Ok(_)) => {}
@@ -794,7 +1362,6 @@ async fn write_chunks(
             Err(_) => return Err(WriteFailure::Stalled),
         }
     }
-    Ok(())
 }
 
 struct Slot {
@@ -804,11 +1371,18 @@ struct Slot {
 
 type Room = HashMap<EndpointId, Slot>;
 
+/// Why a publish was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    NotSubscribed,
+    NoSuchRecipient,
+}
+
 /// Rooms keyed by topic, members keyed by endpoint id, sharded by topic.
 /// Every membership change and the frames it causes are queued under the
-/// room's shard lock, so each client sees a room's events in a consistent
-/// order (snapshot first). Frames are encoded before taking the lock (a
-/// snapshot by the receiving writer) and nothing logs under it.
+/// room's shard lock, so each client sees a room's session events in a
+/// consistent order (snapshot first). Frames are encoded before taking the
+/// lock (a snapshot by the receiving writer) and nothing logs under it.
 struct Rooms {
     shards: Box<[Mutex<HashMap<Topic, Room>>]>,
     max_members: usize,
@@ -861,7 +1435,7 @@ impl Rooms {
             })
             .collect();
         let size = snapshot_wire_len(&members, self.chunk_entries);
-        handle.push(Outgoing::Snapshot { topic, members }, size);
+        handle.push_session(SessionItem::Snapshot { topic, members }, size);
         broadcast(room, handle.peer, &joined);
         Some(room.len())
     }
@@ -910,27 +1484,58 @@ impl Rooms {
         true
     }
 
-    /// Fans a PUBLISH body (`topic ‖ payload`) out as DELIVER, sharing the
-    /// bytes; returns how many members it reached.
-    fn publish(&self, topic: Topic, handle: &MemberHandle, body: Bytes) -> usize {
-        let head = frame_header(tag::DELIVER, body.len());
-        let size = head.len() + body.len();
+    /// Whether the connection holds its slot in the topic's room.
+    fn is_member(&self, topic: Topic, handle: &MemberHandle) -> bool {
+        self.shard(&topic)
+            .get(&topic)
+            .is_some_and(|room| owns_slot(room, handle))
+    }
+
+    /// Queues the DELIVER on `lane` for every other member; returns how many
+    /// members it reached.
+    fn publish(
+        &self,
+        topic: Topic,
+        handle: &MemberHandle,
+        lane: Lane,
+        frame: &Deliver,
+    ) -> Result<usize, Refusal> {
         let shard = self.shard(&topic);
-        let Some(room) = shard.get(&topic) else {
-            return 0;
-        };
-        if !owns_slot(room, handle) {
-            return 0;
-        }
+        let room = shard
+            .get(&topic)
+            .filter(|room| owns_slot(room, handle))
+            .ok_or(Refusal::NotSubscribed)?;
         let mut sent = 0;
         for (id, slot) in room {
             if *id != handle.peer {
-                slot.handle
-                    .push(Outgoing::Parts(head.clone(), body.clone()), size);
+                slot.handle.deliver(lane, frame);
                 sent += 1;
             }
         }
-        sent
+        Ok(sent)
+    }
+
+    /// Queues the DELIVER on `lane` for `recipient` alone, if it is another
+    /// member of the room.
+    fn publish_to(
+        &self,
+        topic: Topic,
+        handle: &MemberHandle,
+        recipient: EndpointId,
+        lane: Lane,
+        frame: &Deliver,
+    ) -> Result<usize, Refusal> {
+        let shard = self.shard(&topic);
+        let room = shard
+            .get(&topic)
+            .filter(|room| owns_slot(room, handle))
+            .ok_or(Refusal::NotSubscribed)?;
+        if recipient == handle.peer {
+            return Err(Refusal::NoSuchRecipient);
+        }
+        let slot = room.get(&recipient).ok_or(Refusal::NoSuchRecipient)?;
+        slot.handle.deliver(lane, frame);
+        Ok(1)
     }
 
     /// Connections of the room's other members, if `handle` is subscribed.
@@ -971,7 +1576,7 @@ fn owns_slot(room: &Room, handle: &MemberHandle) -> bool {
         .is_some_and(|slot| slot.handle.conn_id == handle.conn_id)
 }
 
-/// Queues `frame` for everyone in `room` but `except`.
+/// Queues `frame` on the session stream of everyone in `room` but `except`.
 fn broadcast(room: &Room, except: EndpointId, frame: &Bytes) {
     for (id, slot) in room {
         if *id != except {
@@ -1071,5 +1676,66 @@ mod tests {
         assert!(!bucket.try_take(0));
         std::thread::sleep(Duration::from_millis(5));
         assert!(bucket.try_take(0));
+    }
+
+    fn deliver(payload_len: usize) -> Deliver {
+        Deliver::new(
+            Bytes::from_static(&[1; 32]),
+            Bytes::from(vec![0; payload_len]),
+        )
+    }
+
+    /// Frame size of [`deliver`]: 5-byte header plus the topic.
+    const OVERHEAD: usize = 37;
+
+    fn waiting(queue: &BulkQueue) -> Vec<usize> {
+        queue
+            .lock()
+            .waiting
+            .iter()
+            .map(|frame| frame.payload.len())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bulk_queue_drops_the_oldest_waiting() {
+        let queue = BulkQueue::new(3 * (100 + OVERHEAD));
+        for len in [100, 100, 100] {
+            assert_eq!(queue.push(deliver(len)), 0);
+        }
+        // A fourth of the same size pushes the first out.
+        assert_eq!(queue.push(deliver(100)), 1);
+        assert_eq!(waiting(&queue), [100, 100, 100]);
+        // A larger one pushes out as many as it needs.
+        assert_eq!(queue.push(deliver(200)), 2);
+        assert_eq!(waiting(&queue), [100, 200]);
+        assert_eq!(queue.lock().bytes, 300 + 2 * OVERHEAD);
+    }
+
+    #[tokio::test]
+    async fn bulk_queue_counts_deliveries_on_streams() {
+        let queue = BulkQueue::new(2 * (100 + OVERHEAD));
+        queue.push(deliver(100));
+        queue.push(deliver(100));
+        let on_stream = queue.next().await.unwrap();
+        // One on a stream, one waiting: a third drops the waiting one.
+        assert_eq!(queue.push(deliver(100)), 1);
+        let second = queue.next().await.unwrap();
+        // Both on streams: nothing waiting can make room, so the new one
+        // is dropped.
+        assert_eq!(queue.push(deliver(100)), 1);
+        assert!(waiting(&queue).is_empty());
+        queue.done(on_stream.len());
+        assert_eq!(queue.push(deliver(100)), 0);
+        queue.done(second.len());
+        // An empty budget takes one delivery of any size.
+        let big = BulkQueue::new(10);
+        assert_eq!(big.push(deliver(1000)), 0);
+        assert_eq!(big.push(deliver(1)), 1);
+        // Closing ends `next` once the queue is drained.
+        big.close();
+        assert!(big.next().await.is_some());
+        assert!(big.next().await.is_none());
+        assert_eq!(big.push(deliver(1)), 0);
     }
 }

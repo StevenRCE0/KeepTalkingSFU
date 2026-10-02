@@ -10,13 +10,13 @@ use bytes::Bytes;
 use common::*;
 use iroh::EndpointId;
 use keeptalking_sfu::{
+    client::Inbox,
     proto::{
-        ClientFrame, MAX_ANNOUNCE_LEN, MAX_FRAME_LEN, MAX_PUBLISH_LEN, Member, ServerFrame, Topic,
-        close, tag,
+        ClientFrame, Lane, MAX_ANNOUNCE_LEN, MAX_FRAME_LEN, MAX_PUBLISH_LEN, Member, ServerFrame,
+        Topic, close, tag,
     },
     server::Limits,
 };
-use tokio::sync::mpsc;
 
 /// A second SUBSCRIBE for a topic the connection holds changes nothing: no
 /// snapshot, no JOINED, and the announced blob stays.
@@ -101,7 +101,9 @@ async fn full_room_refuses_subscribe() {
     assert_quiet(&mut rb).await;
     assert_eq!(h.sfu.members(topic).len(), 2);
     // Refused means not subscribed.
-    c.publish(topic, Bytes::from_static(b"x")).await.unwrap();
+    c.publish(Lane::Interactive, topic, Bytes::from_static(b"x"))
+        .await
+        .unwrap();
     assert_eq!(next(&mut rc).await, error(topic, "not subscribed"));
 
     // The same endpoint reconnecting takes its own slot over.
@@ -176,17 +178,20 @@ async fn oversized_frames_are_refused() {
         }
     );
 
-    a.publish(topic, bytes(MAX_PUBLISH_LEN + 1)).await.unwrap();
-    assert_eq!(next(&mut ra).await, error(topic, "publish too large"));
-    assert_quiet(&mut rb).await;
-    a.publish(topic, bytes(MAX_PUBLISH_LEN)).await.unwrap();
-    assert_eq!(
-        next(&mut rb).await,
-        ServerFrame::Deliver {
-            topic,
-            payload: bytes(MAX_PUBLISH_LEN)
-        }
-    );
+    for lane in Lane::ALL {
+        a.publish(lane, topic, bytes(MAX_PUBLISH_LEN + 1))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut ra).await, error(topic, "publish too large"));
+        assert_quiet(&mut rb).await;
+        a.publish(lane, topic, bytes(MAX_PUBLISH_LEN))
+            .await
+            .unwrap();
+        assert_eq!(
+            delivery(&mut rb).await,
+            deliver(lane, topic, bytes(MAX_PUBLISH_LEN))
+        );
+    }
 
     a.subscribe(Topic::ZERO).await.unwrap();
     assert_eq!(
@@ -319,7 +324,7 @@ async fn snapshots_are_chunked() {
 
 /// Reads frames until every member in `want` has been seen with its blob,
 /// in a snapshot or as presence.
-async fn wait_for_blobs(rx: &mut mpsc::Receiver<ServerFrame>, want: &[Member]) {
+async fn wait_for_blobs(rx: &mut Inbox, want: &[Member]) {
     let mut missing: Vec<(EndpointId, Bytes)> =
         want.iter().map(|m| (m.id, m.blob.clone())).collect();
     while !missing.is_empty() {
