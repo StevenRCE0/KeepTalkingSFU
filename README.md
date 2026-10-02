@@ -211,7 +211,7 @@ cargo test
 
 Runs on the signal host as the podman quadlet `keeptalking-sfu-iroh.container` (host networking, Caddy in front: `/relay /derp /ping` → the relay, the info route → the info listener). The image is built locally (`git archive HEAD | docker build --platform linux/amd64 …`) and loaded with `podman load`; the SFU key lives in `/opt/keeptalking-sfu-iroh/hub.key`.
 
-The deployed build predates the SFU rename. Deploying this one is a flag day: the quadlet's `--hub-bind`/`--hub-key` become `--sfu-bind`/`--sfu-key` (keep pointing `--sfu-key` at the existing `hub.key` so the id stays the same), the Caddy route moves from `/kt/hub` to `/kt/sfu`, and clients must speak `keeptalking/sfu/2`. `/kt/sfu` reports `"alpn":"keeptalking/sfu/2"`, so a client built for another version (including `kt-probe --info`) refuses the SFU instead of failing mid-handshake; ship the Swift client update with the deploy. Nothing in the quadlet changes for lanes: same ports, flags and key.
+The deployed build speaks `keeptalking/sfu/1`; the SFU rename already shipped with it (`--sfu-bind`/`--sfu-key` pointing at the existing `hub.key`, so the id is unchanged, and the Caddy route `/kt/sfu`). Deploying this one is a flag day for clients only: they must speak `keeptalking/sfu/2`, which the KeepTalking SDK does from its transport rewrite on. `/kt/sfu` reports `"alpn":"keeptalking/sfu/2"`, so a client built for another version (including `kt-probe --info`) refuses the SFU instead of failing mid-handshake; ship the Swift client update with the deploy. Nothing in the quadlet changes for lanes: same ports, flags and key.
 
 ## Next steps
 
