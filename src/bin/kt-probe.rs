@@ -3,8 +3,11 @@
 //!
 //! - **Mesh:** a direct iroh connection per peer — time to connect,
 //!   relay → direct upgrade, RTT, pings and datagram echoes.
-//! - **SFU:** pings published through the SFU (every other probe answers
-//!   through the SFU) and datagrams fanned out by the SFU.
+//! - **SFU:** pings published through the SFU on the control lane (every
+//!   other probe answers with a pong directed back to the pinger with
+//!   PUBLISH_TO), datagrams fanned out by the SFU, and one 256 KiB bulk-lane
+//!   publish per run, which every receiver acknowledges with a directed
+//!   control message.
 //!
 //! Run the same command on two or more machines with the same `--context`.
 
@@ -41,6 +44,8 @@ const PROBE_ALPN: &[u8] = b"keeptalking/probe/1";
 /// Presence blob a probe announces. The SDK announces a context-sealed blob
 /// here instead; the probe keeps it readable.
 const BLOB_MAGIC: &[u8] = b"kt-probe/1:";
+/// Size of the one bulk publish a probe makes per run.
+const BULK_PROBE_LEN: usize = 256 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -165,6 +170,8 @@ async fn room(args: RoomArgs) -> Result<()> {
         log_paths: args.paths,
         started,
         peers: Mutex::new(HashMap::new()),
+        joined: tokio::sync::watch::Sender::new(false),
+        bulk_sent: Mutex::new(None),
     });
     tokio::spawn(accept_loop(mesh.clone()));
     tokio::spawn(status_loop(mesh.clone()));
@@ -186,7 +193,7 @@ async fn room(args: RoomArgs) -> Result<()> {
                     println!("sfu      connection closed");
                     break;
                 };
-                handle_frame(&mesh, frame);
+                mesh.session_frame(frame);
             }
             Some(delivery) = inbox.deliveries.recv() => {
                 mesh.sfu_message(&sfu, topic, delivery).await;
@@ -202,29 +209,6 @@ async fn room(args: RoomArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_frame(mesh: &Arc<Mesh>, frame: ServerFrame) {
-    match frame {
-        ServerFrame::Snapshot { members, .. } => {
-            println!("room     snapshot: {} other member(s)", members.len());
-            for member in members {
-                mesh.learn(member.id, &member.blob);
-            }
-        }
-        ServerFrame::Joined { id, .. } => println!("room     + {}", id.fmt_short()),
-        ServerFrame::Presence { id, blob, .. } => mesh.learn(id, &blob),
-        ServerFrame::Left { id, .. } => {
-            println!("room     - {}", id.fmt_short());
-            mesh.forget(id);
-        }
-        // DELIVERs arrive on lane streams, as `Delivery`.
-        ServerFrame::Deliver { .. } => {}
-        ServerFrame::Error { topic, reason } => match topic {
-            Some(topic) => println!("sfu      error on {}: {reason}", topic.fmt_short()),
-            None => println!("sfu      error: {reason}"),
-        },
-    }
-}
-
 struct Mesh {
     endpoint: Endpoint,
     me: EndpointId,
@@ -235,6 +219,11 @@ struct Mesh {
     /// Every peer ever seen; entries stay after a peer leaves so the
     /// summary covers them.
     peers: Mutex<HashMap<EndpointId, Arc<PeerStats>>>,
+    /// Set once our SNAPSHOT arrived: only then may we publish (lane
+    /// streams are not ordered against our SUBSCRIBE).
+    joined: tokio::sync::watch::Sender<bool>,
+    /// When our bulk publish went out, and to how many peers.
+    bulk_sent: Mutex<Option<(Duration, usize)>>,
 }
 
 #[derive(Default)]
@@ -256,9 +245,51 @@ struct PeerStats {
     sfu_pongs: AtomicU64,
     /// SFU-forwarded datagrams received from this peer.
     sfu_dgrams: AtomicU64,
+    /// Our bulk publish, from sending it to this peer's directed ack.
+    bulk_rtt: Mutex<Option<Duration>>,
+    /// Bulk payload bytes received from this peer.
+    bulk_in: AtomicU64,
 }
 
 impl Mesh {
+    fn session_frame(self: &Arc<Self>, frame: ServerFrame) {
+        match frame {
+            ServerFrame::Snapshot { members, .. } => {
+                println!("room     snapshot: {} other member(s)", members.len());
+                for member in members {
+                    self.learn(member.id, &member.blob);
+                }
+                self.joined.send_replace(true);
+            }
+            ServerFrame::Joined { id, .. } => println!("room     + {}", id.fmt_short()),
+            ServerFrame::Presence { id, blob, .. } => self.learn(id, &blob),
+            ServerFrame::Left { id, .. } => {
+                println!("room     - {}", id.fmt_short());
+                self.forget(id);
+            }
+            // DELIVERs arrive on lane streams, as `Delivery`.
+            ServerFrame::Deliver { .. } => {}
+            ServerFrame::Error { topic, reason } => match topic {
+                Some(topic) => println!("sfu      error on {}: {reason}", topic.fmt_short()),
+                None => println!("sfu      error: {reason}"),
+            },
+        }
+    }
+
+    /// Peers whose presence we have seen.
+    fn known_peers(&self) -> usize {
+        self.peers
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|stats| stats.learned_at.lock().unwrap().is_some())
+            .count()
+    }
+
+    fn stats(&self, id: EndpointId) -> Arc<PeerStats> {
+        self.peers.lock().unwrap().entry(id).or_default().clone()
+    }
+
     /// A peer's presence arrived. Its id is taken from the blob (the SDK's
     /// sealed envelope), never from the server; the lower id dials.
     fn learn(self: &Arc<Self>, reported: EndpointId, blob: &[u8]) {
@@ -305,43 +336,107 @@ impl Mesh {
         }
     }
 
-    /// A payload the SFU fanned out to us: a ping to answer or a pong to
-    /// time. `P ‖ from ‖ seq ‖ t_ns` / `Q ‖ to ‖ from ‖ seq ‖ t_ns`.
+    /// A payload the SFU delivered to us:
+    ///
+    /// - `P ‖ from ‖ seq ‖ t_ns` (control, broadcast): a ping, answered
+    ///   with `Q ‖ from ‖ me ‖ seq ‖ t_ns` directed to `from`.
+    /// - `Q ‖ to ‖ from ‖ seq ‖ t_ns` (control, directed): a pong to time.
+    /// - `B ‖ from ‖ seq ‖ t_ns ‖ padding` (bulk, broadcast): a bulk probe,
+    ///   acknowledged with `A ‖ from ‖ me ‖ t_ns ‖ u32 len` directed to `from`.
+    /// - `A ‖ to ‖ from ‖ t_ns ‖ u32 len` (control, directed): a bulk ack.
     async fn sfu_message(&self, sfu: &SfuClient, topic: Topic, delivery: Delivery) {
-        let mut payload = delivery.payload;
+        let Delivery { lane, payload, .. } = delivery;
+        let total = payload.len();
+        let mut payload = payload;
         if payload.remaining() < 1 {
             return;
         }
-        match payload.get_u8() {
+        let kind = payload.get_u8();
+        let expected = if kind == b'B' {
+            Lane::Bulk
+        } else {
+            Lane::Control
+        };
+        if lane != expected {
+            println!("lane     ! '{}' arrived on {lane}", kind.escape_ascii());
+        }
+        match kind {
             b'P' if payload.remaining() >= 48 => {
-                let from = payload.split_to(32);
+                let Some(from) = take_id(&mut payload) else {
+                    return;
+                };
                 let mut pong = BytesMut::with_capacity(81);
                 pong.put_u8(b'Q');
-                pong.put_slice(&from);
+                pong.put_slice(from.as_bytes());
                 pong.put_slice(self.me.as_bytes());
                 pong.put_slice(&payload);
-                let _ = sfu.publish(Lane::Control, topic, pong.freeze()).await;
+                let _ = sfu
+                    .publish_to(Lane::Control, topic, from, pong.freeze())
+                    .await;
             }
             b'Q' if payload.remaining() >= 80 => {
-                let to = payload.split_to(32);
-                if to[..] != self.me.as_bytes()[..] {
+                let (Some(to), Some(from)) = (take_id(&mut payload), take_id(&mut payload)) else {
+                    return;
+                };
+                if to != self.me {
+                    println!("sfu      ! pong for {} reached us", to.fmt_short());
                     return;
                 }
-                let from: [u8; 32] = payload.split_to(32)[..].try_into().expect("32 bytes");
-                let Ok(from) = EndpointId::from_bytes(&from) else {
+                let _seq = payload.get_u64();
+                let rtt = self.since(payload.get_u64());
+                let stats = self.stats(from);
+                *stats.sfu_rtt.lock().unwrap() = Some(rtt);
+                stats.sfu_pongs.fetch_add(1, Ordering::Relaxed);
+            }
+            b'B' if payload.remaining() >= 48 => {
+                let Some(from) = take_id(&mut payload) else {
                     return;
                 };
                 let _seq = payload.get_u64();
                 let sent_ns = payload.get_u64();
-                let rtt = self
-                    .since_start()
-                    .saturating_sub(Duration::from_nanos(sent_ns));
-                let stats = self.peers.lock().unwrap().entry(from).or_default().clone();
-                *stats.sfu_rtt.lock().unwrap() = Some(rtt);
-                stats.sfu_pongs.fetch_add(1, Ordering::Relaxed);
+                self.stats(from)
+                    .bulk_in
+                    .fetch_add(total as u64, Ordering::Relaxed);
+                println!(
+                    "bulk     {} KiB from {} on {lane}",
+                    total / 1024,
+                    from.fmt_short()
+                );
+                let mut ack = BytesMut::with_capacity(77);
+                ack.put_u8(b'A');
+                ack.put_slice(from.as_bytes());
+                ack.put_slice(self.me.as_bytes());
+                ack.put_u64(sent_ns);
+                ack.put_u32(total as u32);
+                let _ = sfu
+                    .publish_to(Lane::Control, topic, from, ack.freeze())
+                    .await;
+            }
+            b'A' if payload.remaining() >= 76 => {
+                let (Some(to), Some(from)) = (take_id(&mut payload), take_id(&mut payload)) else {
+                    return;
+                };
+                if to != self.me {
+                    return;
+                }
+                let rtt = self.since(payload.get_u64());
+                let len = payload.get_u32() as usize;
+                if len != BULK_PROBE_LEN {
+                    println!(
+                        "bulk     ! {} got {len} of {BULK_PROBE_LEN} bytes",
+                        from.fmt_short()
+                    );
+                }
+                *self.stats(from).bulk_rtt.lock().unwrap() = Some(rtt);
             }
             _ => {}
         }
+    }
+
+    /// Time since a `t_ns` stamp taken from [`Self::since_start`].
+    fn since(&self, sent_ns: u64) -> Duration {
+        self.since_start()
+            .saturating_sub(Duration::from_nanos(sent_ns))
     }
 
     fn since_start(&self) -> Duration {
@@ -392,6 +487,21 @@ impl Mesh {
     fn print_summary(&self) {
         let peers = self.peers.lock().unwrap();
         println!("\nsummary  {} peer(s)", peers.len());
+        match *self.bulk_sent.lock().unwrap() {
+            Some((at, to)) => {
+                let acked: Vec<Duration> = peers
+                    .values()
+                    .filter_map(|stats| *stats.bulk_rtt.lock().unwrap())
+                    .collect();
+                println!(
+                    "  bulk {} KiB at {at:.1?} to {to} peer(s): acked by {}, slowest {}",
+                    BULK_PROBE_LEN / 1024,
+                    acked.len(),
+                    fmt_opt(acked.iter().max().copied()),
+                );
+            }
+            None => println!("  bulk not sent (no peer seen)"),
+        }
         for (id, stats) in peers.iter() {
             println!(
                 "  {}  connect {}  direct {}  rtt {}  {}",
@@ -405,14 +515,44 @@ impl Mesh {
     }
 }
 
-/// Every tick: one ping published through the SFU (all other probes answer
-/// through the SFU) and one datagram the SFU fans out.
+/// Every tick: one ping published through the SFU on the control lane (all
+/// other probes answer with a directed pong) and one datagram the SFU fans
+/// out. Once there is a peer, one bulk-lane publish per run.
 async fn sfu_ping_loop(mesh: Arc<Mesh>, sfu: Arc<SfuClient>, topic: Topic) {
+    if mesh
+        .joined
+        .subscribe()
+        .wait_for(|joined| *joined)
+        .await
+        .is_err()
+    {
+        return;
+    }
     let mut tick = tokio::time::interval(mesh.interval);
     let mut seq = 0u64;
     loop {
         tick.tick().await;
         seq += 1;
+        if mesh.bulk_sent.lock().unwrap().is_none() {
+            let peers = mesh.known_peers();
+            if peers > 0 {
+                let sent = mesh.since_start();
+                let mut bulk = BytesMut::with_capacity(BULK_PROBE_LEN);
+                bulk.put_u8(b'B');
+                bulk.put_slice(mesh.me.as_bytes());
+                bulk.put_u64(seq);
+                bulk.put_u64(sent.as_nanos() as u64);
+                bulk.resize(BULK_PROBE_LEN, 0);
+                *mesh.bulk_sent.lock().unwrap() = Some((sent, peers));
+                println!(
+                    "bulk     publishing {} KiB to {peers} peer(s)",
+                    BULK_PROBE_LEN / 1024
+                );
+                if let Err(err) = sfu.publish(Lane::Bulk, topic, bulk.freeze()).await {
+                    println!("bulk     publish failed: {err:#}");
+                }
+            }
+        }
         let sent_ns = mesh.since_start().as_nanos() as u64;
         let mut ping = BytesMut::with_capacity(49);
         ping.put_u8(b'P');
@@ -605,10 +745,12 @@ async fn echo_loop(conn: &Connection) -> Result<()> {
 impl PeerStats {
     fn traffic(&self) -> String {
         let sfu = format!(
-            "sfu rtt {} x{} dgrams {}",
+            "sfu rtt {} x{} dgrams {} bulk rtt {} in {} KiB",
             fmt_opt(*self.sfu_rtt.lock().unwrap()),
             self.sfu_pongs.load(Ordering::Relaxed),
             self.sfu_dgrams.load(Ordering::Relaxed),
+            fmt_opt(*self.bulk_rtt.lock().unwrap()),
+            self.bulk_in.load(Ordering::Relaxed) / 1024,
         );
         if !self.initiator.load(Ordering::Relaxed) {
             return format!("echoing  {sfu}");
@@ -621,6 +763,15 @@ impl PeerStats {
             self.dgrams_sent.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Splits a 32-byte endpoint id off the front of `payload`.
+fn take_id(payload: &mut bytes::Bytes) -> Option<EndpointId> {
+    if payload.remaining() < 32 {
+        return None;
+    }
+    let bytes: [u8; 32] = payload.split_to(32)[..].try_into().ok()?;
+    EndpointId::from_bytes(&bytes).ok()
 }
 
 fn parse_blob(blob: &[u8]) -> Option<EndpointId> {
