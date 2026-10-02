@@ -8,7 +8,9 @@
 //!   SFU never learns the context. It relays sealed presence blobs (peers
 //!   learn each other's endpoint ids from them, so the server cannot swap in
 //!   its own key) and fans published payloads and datagrams out to the room,
-//!   so a sender in a large room uploads once.
+//!   so a sender in a large room uploads once, or hands a payload to one
+//!   member. Payloads ride prioritised control, interactive and bulk lanes,
+//!   so a large transfer never holds up small messages.
 //! - **Info.** `GET /kt/sfu` (behind the proxy) tells clients the SFU id.
 
 pub mod client;

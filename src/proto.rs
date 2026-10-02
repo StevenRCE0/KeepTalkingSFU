@@ -27,7 +27,7 @@
 //! | C→S | 0x21 | SUBSCRIBE   | topic(32)                                                      |
 //! | C→S | 0x22 | UNSUBSCRIBE | topic(32)                                                      |
 //! | C→S | 0x23 | ANNOUNCE    | topic(32) ‖ blob (≤ 1 KiB)                                     |
-//! | S→C | 0x31 | SNAPSHOT    | topic ‖ flags(u8) ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob[len]) |
+//! | S→C | 0x31 | SNAPSHOT    | topic ‖ flags(u8) ‖ u16 n ‖ n × (id(32) ‖ u32 len ‖ blob)      |
 //! | S→C | 0x32 | JOINED      | topic ‖ id(32)                                                 |
 //! | S→C | 0x33 | LEFT        | topic ‖ id(32)                                                 |
 //! | S→C | 0x34 | PRESENCE    | topic ‖ id(32) ‖ blob                                          |
@@ -74,6 +74,10 @@
 //!   stream ([`stream_error::MALFORMED`]).
 //! - The SFU resets a bulk stream towards a client that makes no progress
 //!   for its stall timeout ([`stream_error::STALLED`]); the connection stays.
+//! - Stream counts: the SFU lets a client keep 16 lane streams open (its two
+//!   long-lived lanes plus concurrent bulk uploads; a further open waits for
+//!   credit) and keeps up to 16 bulk streams open towards a client, so a
+//!   client must accept at least 18 incoming unidirectional streams.
 //!
 //! ## Ordering
 //!
