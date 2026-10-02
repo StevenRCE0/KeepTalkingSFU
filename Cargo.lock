@@ -1654,8 +1654,10 @@ dependencies = [
  "rustls",
  "sha2",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

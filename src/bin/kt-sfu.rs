@@ -179,6 +179,15 @@ async fn main() -> Result<()> {
                 .or(sfu.relay_quic_addr().map(|addr| addr.port())),
         );
         println!("info       http://{bind}{}", info::INFO_PATH);
+        println!(
+            "probe      kt-probe room --info http://{bind}{}{} --context <uuid>",
+            info::INFO_PATH,
+            if args.dev {
+                format!(" --relay-ca {}", args.dev_cert_out.display())
+            } else {
+                String::new()
+            }
+        );
         tokio::spawn(info::serve(listener, body));
     }
 

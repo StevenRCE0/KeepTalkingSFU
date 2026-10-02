@@ -28,11 +28,13 @@ use iroh::{
 use iroh_relay::RelayQuicConfig;
 use keeptalking_sfu::{
     client::{ClientOptions, SfuClient, bind_client},
+    info,
     proto::{ServerFrame, Topic},
     tls::ca_from_pem_file,
 };
 use n0_future::StreamExt;
 use sha2::{Digest, Sha256};
+use url::Url;
 use uuid::Uuid;
 
 const PROBE_ALPN: &[u8] = b"keeptalking/probe/1";
@@ -53,15 +55,20 @@ enum Command {
 #[derive(Parser, Debug)]
 struct RoomArgs {
     /// SFU endpoint id printed by kt-sfu.
-    #[arg(long)]
-    sfu: EndpointId,
+    #[arg(long, required_unless_present = "info")]
+    sfu: Option<EndpointId>,
     /// Relay URL printed by kt-sfu.
-    #[arg(long)]
-    relay: RelayUrl,
+    #[arg(long, required_unless_present = "info")]
+    relay: Option<RelayUrl>,
+    /// Look the SFU id, relay URL and QAD port up at the info endpoint
+    /// instead, e.g. https://signal.rcex.live/kt/sfu.
+    #[arg(long, conflicts_with_all = ["sfu", "relay"])]
+    info: Option<Url>,
     /// QUIC address-discovery port of the relay (kt-sfu prints it).
     #[arg(long)]
     qad_port: Option<u16>,
-    /// PEM root to trust for the relay (the file `kt-sfu --dev` writes).
+    /// PEM root to trust for the relay and the info URL (the file
+    /// `kt-sfu --dev` writes).
     #[arg(long)]
     relay_ca: Option<PathBuf>,
     /// Context to join; the topic is SHA-256("kt-probe/" ‖ context). A random
@@ -99,9 +106,27 @@ async fn main() -> Result<()> {
 
 async fn room(args: RoomArgs) -> Result<()> {
     let started = Instant::now();
-    let relay_map: iroh::RelayMap =
-        iroh::RelayConfig::new(args.relay.clone(), args.qad_port.map(RelayQuicConfig::new)).into();
     let ca = args.relay_ca.as_deref().map(ca_from_pem_file).transpose()?;
+    let (sfu_id, relay, qad_port) = match &args.info {
+        Some(url) => {
+            let info = info::fetch_info(url, ca.as_ref()).await?;
+            println!(
+                "info     {url}: sfu {} relay {}",
+                info.sfu.fmt_short(),
+                info.relay
+            );
+            (info.sfu, info.relay, args.qad_port.or(info.qad_port))
+        }
+        None => (
+            args.sfu.context("--sfu is required without --info")?,
+            args.relay
+                .clone()
+                .context("--relay is required without --info")?,
+            args.qad_port,
+        ),
+    };
+    let relay_map: iroh::RelayMap =
+        iroh::RelayConfig::new(relay.clone(), qad_port.map(RelayQuicConfig::new)).into();
     let endpoint = bind_client(ClientOptions {
         relay_map,
         ca,
@@ -122,7 +147,7 @@ async fn room(args: RoomArgs) -> Result<()> {
     println!("me       {me}");
     println!("topic    {topic}");
 
-    let sfu_addr = EndpointAddr::new(args.sfu).with_relay_url(args.relay.clone());
+    let sfu_addr = EndpointAddr::new(sfu_id).with_relay_url(relay.clone());
     let (sfu, mut frames) = SfuClient::connect(&endpoint, sfu_addr).await?;
     let sfu = Arc::new(sfu);
     println!("sfu      connected in {:?}", started.elapsed());
@@ -134,7 +159,7 @@ async fn room(args: RoomArgs) -> Result<()> {
     let mesh = Arc::new(Mesh {
         endpoint: endpoint.clone(),
         me,
-        relay: args.relay.clone(),
+        relay,
         interval: Duration::from_secs_f64(args.interval),
         log_paths: args.paths,
         started,

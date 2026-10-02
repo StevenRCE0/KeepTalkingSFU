@@ -307,6 +307,15 @@ async fn info_endpoint_serves_sfu_id() {
     assert!(get("/other").await.starts_with("HTTP/1.1 404"));
     // The pre-rename path is gone.
     assert!(get("/kt/hub").await.starts_with("HTTP/1.1 404"));
+
+    // The reference client reads it back.
+    let url: url::Url = format!("http://{addr}{}", info::INFO_PATH).parse().unwrap();
+    let fetched = info::fetch_info(&url, None).await.unwrap();
+    assert_eq!(fetched.sfu, h.sfu.sfu_id());
+    assert_eq!(&fetched.relay, h.sfu.relay_url());
+    assert_eq!(fetched.qad_port, Some(7842));
+    let old: url::Url = format!("http://{addr}/kt/hub").parse().unwrap();
+    assert!(info::fetch_info(&old, None).await.is_err());
 }
 
 /// A client that connects and never sends a request does not hold the
