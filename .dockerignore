@@ -1,0 +1,10 @@
+/target
+/tests
+.git/
+.github/
+.gitignore
+Dockerfile
+.dockerignore
+*.md
+*.pem
+*.key

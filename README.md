@@ -1,4 +1,4 @@
-# KeepTalkingSFU (iroh branch)
+# KeepTalkingSFU
 
 A Rust rewrite of the KeepTalking SFU. It does three things:
 
@@ -8,7 +8,7 @@ A Rust rewrite of the KeepTalking SFU. It does three things:
 
 Peers choose per message between **mesh** delivery (their own iroh connections, which start on this relay and go direct when hole punching works) and **SFU** delivery (one upload, fanned out here). The SFU never needs to read a payload.
 
-This branch is an orphan and shares no history with the Swift SFU on `main`.
+This replaced the Swift SFU on `main` (2026-10-02). The Swift SFU's history is kept under the tag `swift-sfu`.
 
 ## Layout
 
@@ -205,18 +205,19 @@ cargo test
 - **Public addresses:** set `--public-relay-url https://signal.rcex.live`, plus `--public-quic-port` if the load balancer remaps it.
 - **SFU flags:** `--sfu-bind` (UDP, default `[::]:9702`), `--sfu-key`, `--info-bind`, `--max-connections`, `--relay-client-rate`, `--relay-client-burst` (env `KT_SFU_BIND`, `KT_SFU_KEY`, `KT_SFU_INFO_BIND`, `KT_SFU_MAX_CONNECTIONS`, `KT_SFU_RELAY_CLIENT_RATE`, `KT_SFU_RELAY_CLIENT_BURST`).
 - **SFU key:** persist `--sfu-key`. Clients look the SFU id up at `/kt/sfu`, but a changing id still drops every SFU session on restart.
-- **CI:** this branch has no CI workflow, so it never publishes the `latest` image that Keel rolls out.
+- **CI:** `.github/workflows/docker.yml` runs `cargo test`, then builds `ghcr.io/stevenrce0/keeptalkingsfu` for amd64 and arm64. Pushes to `main` tag `latest`, `main` and `sha-<short>`; `v*.*.*` tags add semver tags.
 
 ## Deployed
 
-Runs on the signal host as the podman quadlet `keeptalking-sfu-iroh.container` (host networking, Caddy in front: `/relay /derp /ping` → the relay, the info route → the info listener). The image is built locally (`git archive HEAD | docker build --platform linux/amd64 …`) and loaded with `podman load`; the SFU key lives in `/opt/keeptalking-sfu-iroh/hub.key`.
+Runs on the signal host as the podman quadlet `keeptalking-sfu-iroh.container` (host networking, Caddy in front: `/relay /derp /ping` → the relay, the info route → the info listener). The quadlet runs `ghcr.io/stevenrce0/keeptalkingsfu:latest`; the SFU key lives in `/opt/keeptalking-sfu-iroh/hub.key`.
+
+After each push to `main` the workflow's `deploy` job SSHes in, tags the running image `:previous`, pulls the new manifest by digest, retags it `:latest`, restarts `keeptalking-sfu-iroh.service` and checks `/kt/sfu`. It needs the repository secrets `DEPLOY_SSH_KEY` (a private key authorised on the host), `DEPLOY_HOST` (`root@<host>`) and `DEPLOY_KNOWN_HOSTS` (`ssh-keyscan <host>`); without them the job is skipped. Manual runs deploy only with the `deploy` input. Rollback: `podman tag ghcr.io/stevenrce0/keeptalkingsfu:previous ghcr.io/stevenrce0/keeptalkingsfu:latest && systemctl restart keeptalking-sfu-iroh`.
 
 The deployed build speaks `keeptalking/sfu/2` (since 2026-10-02 17:54 UTC; the previous `sfu/1` image is tagged `localhost/keeptalking-sfu-iroh:sfu-v1` for rollback). There is one protocol version: `/kt/sfu` reports `"alpn":"keeptalking/sfu/2"`, and a client built for another version (including `kt-probe --info`) refuses the SFU instead of failing mid-handshake. The quadlet is unchanged: same ports, flags and key, so the SFU id stays `1efb5c51…`.
 
 ## Next steps
 
 - Relay access control once there is a credential to check.
-- CI that publishes the image, so deploys stop being a manual `podman load`.
 - Watch relay and SFU bandwidth once voice moves over (relayed mesh and SFU fan-out both multiply on this box).
 - Rate limits are per sending connection, so fan-out still multiplies them by the room size (up to 1023 copies). Charging a sender per delivered copy would bound the SFU's egress directly; directed publishes already cost one copy.
 - The `sfu totals` log line (every minute) now has per-lane `published.*`/`delivered.*`, `directed`, `bulk_dropped`, `bulk_stalled`, `bad_lanes` and `bulk_stopped`; watch `bulk_dropped` once context sync moves to the bulk lane.

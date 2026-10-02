@@ -1,0 +1,203 @@
+name: Build, publish & deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy the built image to the signal host
+        type: boolean
+        default: false
+
+env:
+  IMAGE_NAME: ghcr.io/stevenrce0/keeptalkingsfu
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build pull request image
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.architecture }}
+          provenance: false
+
+      - name: Build and push by digest
+        id: build
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.architecture }}
+          provenance: false
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.architecture }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create multi-architecture manifest
+        id: manifest
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          tags=()
+          while IFS= read -r tag; do tags+=(--tag "$tag"); done <<< "$TAGS"
+          sources=()
+          for digest in /tmp/digests/*; do
+            sources+=("${IMAGE_NAME}@sha256:${digest##*/}")
+          done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          digest=$(docker buildx imagetools inspect "${IMAGE_NAME}:sha-${GITHUB_SHA::7}" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect "${IMAGE_NAME}:sha-${GITHUB_SHA::7}"
+
+  # Pulls the new image on the signal host and restarts the quadlet. Runs on
+  # main pushes and opt-in manual runs; it is skipped until the repository
+  # has the DEPLOY_SSH_KEY, DEPLOY_HOST and DEPLOY_KNOWN_HOSTS secrets.
+  deploy:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy)
+    needs: merge
+    runs-on: ubuntu-24.04
+    environment: production
+    concurrency: deploy-signal
+    env:
+      SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+      KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      DIGEST: ${{ needs.merge.outputs.digest }}
+      UNIT: keeptalking-sfu-iroh.service
+    steps:
+      - name: Check deploy secrets
+        id: secrets
+        run: |
+          if [ -n "$SSH_KEY" ] && [ -n "$SSH_HOST" ] && [ -n "$KNOWN_HOSTS" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Deploy skipped: set DEPLOY_SSH_KEY, DEPLOY_HOST and DEPLOY_KNOWN_HOSTS to enable it."
+          fi
+
+      - name: Configure SSH
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      # Keeps the running image as :previous for rollback, pulls the new
+      # manifest by digest (so a later push can't race it), retags it as the
+      # quadlet's :latest and restarts the unit.
+      - name: Pull and restart
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes "$SSH_HOST" \
+            IMAGE="$IMAGE_NAME" DIGEST="$DIGEST" UNIT="$UNIT" 'bash -s' <<'EOF'
+          set -euo pipefail
+          podman image exists "$IMAGE:latest" && podman tag "$IMAGE:latest" "$IMAGE:previous"
+          podman pull "$IMAGE@$DIGEST"
+          podman tag "$IMAGE@$DIGEST" "$IMAGE:latest"
+          systemctl restart "$UNIT"
+          sleep 5
+          systemctl is-active "$UNIT"
+          curl -fsS https://signal.rcex.live/kt/sfu
+          EOF
