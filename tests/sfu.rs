@@ -309,6 +309,37 @@ async fn info_endpoint_serves_sfu_id() {
     assert!(get("/kt/hub").await.starts_with("HTTP/1.1 404"));
 }
 
+/// A client that connects and never sends a request does not hold the
+/// listener up for anyone else.
+#[tokio::test]
+async fn info_endpoint_survives_idle_clients() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(info::serve(listener, "{}".into()));
+    let _idle: Vec<_> = idle_connections(addr, 20).await;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /kt/sfu HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = String::new();
+    tokio::time::timeout(WAIT, stream.read_to_string(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+}
+
+async fn idle_connections(addr: std::net::SocketAddr, count: usize) -> Vec<tokio::net::TcpStream> {
+    let mut idle = Vec::new();
+    for _ in 0..count {
+        idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+    }
+    idle
+}
+
 /// Peers with no IP transports can only reach each other through the
 /// embedded relay.
 #[tokio::test]

@@ -12,7 +12,7 @@ use iroh::{
 use keeptalking_sfu::{
     client::{ClientOptions, SfuClient, bind_client},
     proto::{ClientFrame, Member, SFU_ALPN, ServerFrame, Topic, read_frame},
-    server::{Limits, Sfu, SfuConfig},
+    server::{Limits, RelayRateLimit, Sfu, SfuConfig},
     tls::DevCert,
 };
 use tokio::sync::mpsc;
@@ -40,6 +40,7 @@ impl Harness {
             cert: dev.cert_config().unwrap(),
             public_relay_url: None,
             public_quic_port: None,
+            relay_rate_limit: Some(RelayRateLimit::default()),
             sfu_bind: vec![local(0)],
             sfu_secret: SecretKey::generate(),
             sfu_ca: Some(dev.ca()),

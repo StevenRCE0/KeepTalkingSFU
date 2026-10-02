@@ -566,19 +566,23 @@ pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<(u8
         return Err(FrameLengthError(len).into());
     }
     // Grow the buffer as bytes arrive instead of trusting the declared
-    // length up front.
-    let mut buf = BytesMut::with_capacity(len.min(READ_STEP));
+    // length up front: double it (never past `len`) each time it fills, so
+    // the final buffer is exactly the frame, which DELIVER shares as is.
+    let mut buf: Vec<u8> = Vec::with_capacity(len.min(READ_STEP));
     while buf.len() < len {
-        let step = (len - buf.len()).min(READ_STEP);
-        buf.reserve(step);
+        if buf.len() == buf.capacity() {
+            let target = (buf.capacity() * 2).max(READ_STEP).min(len);
+            buf.reserve_exact(target - buf.len());
+        }
+        let room = (len - buf.len()).min(buf.capacity() - buf.len());
         let read = (&mut *recv)
-            .take(step as u64)
+            .take(room as u64)
             .read_buf(&mut buf)
             .await
             .context("reading frame body")?;
         ensure!(read > 0, "truncated frame");
     }
-    let mut buf = buf.freeze();
+    let mut buf = Bytes::from(buf);
     let tag = buf.get_u8();
     Ok(Some((tag, buf)))
 }

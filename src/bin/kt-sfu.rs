@@ -1,14 +1,14 @@
 //! `kt-sfu`: KeepTalking SFU (presence + topic fan-out) with an embedded iroh
 //! relay.
 
-use std::{net::SocketAddr, path::PathBuf, sync::atomic::Ordering, time::Duration};
+use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use iroh::{RelayUrl, SecretKey};
 use keeptalking_sfu::{
     info,
-    server::{Limits, Sfu, SfuConfig},
+    server::{Limits, RelayRateLimit, Sfu, SfuConfig, StatsSnapshot},
     tls::{DevCert, reloading_cert},
 };
 use tracing::info;
@@ -84,6 +84,20 @@ struct Args {
     /// Put it behind the TLS proxy at the relay's domain.
     #[arg(long, env = "KT_SFU_INFO_BIND")]
     info_bind: Option<SocketAddr>,
+
+    /// Bytes per second the relay reads from each client connection; 0
+    /// disables the limit. The SFU endpoint's own relay connection, which
+    /// carries its fan-out to relay-only clients, is limited too.
+    #[arg(long, env = "KT_SFU_RELAY_CLIENT_RATE", default_value_t = 2 * 1024 * 1024)]
+    relay_client_rate: u32,
+
+    /// Burst allowance, in bytes, for --relay-client-rate.
+    #[arg(long, env = "KT_SFU_RELAY_CLIENT_BURST", default_value_t = 4 * 1024 * 1024)]
+    relay_client_burst: u32,
+
+    /// Concurrent SFU connections; handshakes beyond it are refused.
+    #[arg(long, env = "KT_SFU_MAX_CONNECTIONS", default_value_t = 10_000)]
+    max_connections: usize,
 }
 
 #[tokio::main]
@@ -118,10 +132,17 @@ async fn main() -> Result<()> {
         cert,
         public_relay_url: args.public_relay_url,
         public_quic_port: args.public_quic_port,
+        relay_rate_limit: NonZeroU32::new(args.relay_client_rate).map(|rate| RelayRateLimit {
+            bytes_per_second: rate,
+            burst_bytes: NonZeroU32::new(args.relay_client_burst).unwrap_or(rate),
+        }),
         sfu_bind: args.sfu_bind,
         sfu_secret,
         sfu_ca,
-        limits: Limits::default(),
+        limits: Limits {
+            max_connections: args.max_connections,
+            ..Limits::default()
+        },
     })
     .await?;
 
@@ -157,32 +178,31 @@ async fn main() -> Result<()> {
             args.public_quic_port
                 .or(sfu.relay_quic_addr().map(|addr| addr.port())),
         );
-        println!("info       http://{bind}/kt/sfu");
-        tokio::spawn(async move {
-            if let Err(err) = info::serve(listener, body).await {
-                tracing::error!("info listener stopped: {err:#}");
-            }
-        });
+        println!("info       http://{bind}{}", info::INFO_PATH);
+        tokio::spawn(info::serve(listener, body));
     }
 
-    let stats_sfu = sfu.stats_handle();
+    let stats = sfu.stats_handle();
     tokio::spawn(async move {
-        let mut last = (0, 0, 0, 0);
+        let mut last = StatsSnapshot::default();
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
-            let now = (
-                stats_sfu.published.load(Ordering::Relaxed),
-                stats_sfu.delivered.load(Ordering::Relaxed),
-                stats_sfu.datagrams_in.load(Ordering::Relaxed),
-                stats_sfu.datagrams_out.load(Ordering::Relaxed),
-            );
+            let now = stats.snapshot();
             if now != last {
                 info!(
-                    published = now.0,
-                    delivered = now.1,
-                    datagrams_in = now.2,
-                    datagrams_out = now.3,
+                    connections = now.connections,
+                    refused = now.connections_refused,
+                    no_stream = now.no_stream,
+                    slow_consumers = now.slow_consumers,
+                    stalled = now.stalled,
+                    published = now.published,
+                    delivered = now.delivered,
+                    rate_limited = now.rate_limited,
+                    malformed = now.malformed,
+                    datagrams_in = now.datagrams_in,
+                    datagrams_out = now.datagrams_out,
+                    datagrams_dropped = now.datagrams_dropped,
                     "sfu totals"
                 );
                 last = now;
