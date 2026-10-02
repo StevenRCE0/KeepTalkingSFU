@@ -1,7 +1,7 @@
-//! Wire format of the hub protocol (ALPN [`HUB_ALPN`]).
+//! Wire format of the SFU protocol (ALPN [`SFU_ALPN`]).
 //!
 //! A client opens exactly one bidirectional QUIC stream on its connection to
-//! the hub and speaks first. Both directions carry length-prefixed,
+//! the SFU and speaks first. Both directions carry length-prefixed,
 //! type-tagged frames:
 //!
 //! ```text
@@ -9,7 +9,7 @@
 //! ```
 //!
 //! Rooms are keyed by a 32-byte **topic**. Clients derive it from their
-//! context secret, so the hub never learns which context a room is; it only
+//! context secret, so the SFU never learns which context a room is; it only
 //! groups subscribers. Identity is the QUIC connection's authenticated
 //! remote `EndpointId`; there is no hello/challenge.
 //!
@@ -36,13 +36,13 @@
 //! - ANNOUNCE stores the sender's presence blob (its context-sealed endpoint
 //!   id) and is relayed as PRESENCE; a late subscriber gets every latest blob
 //!   in its SNAPSHOT. A zero-length blob means "not announced yet".
-//! - PUBLISH is reliable fan-out: the hub sends DELIVER with the same payload
+//! - PUBLISH is reliable fan-out: the SFU sends DELIVER with the same payload
 //!   to every *other* subscriber, so a sender uploads once however large the
 //!   room. DELIVER does not name the sender; the sealed payload does.
 //!
 //! # Datagrams
 //!
-//! QUIC datagrams on the hub connection are `topic(32) ‖ payload`. The hub
+//! QUIC datagrams on the SFU connection are `topic(32) ‖ payload`. The SFU
 //! forwards the identical bytes to every other subscriber, best effort (voice).
 
 use std::fmt;
@@ -52,8 +52,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use iroh::EndpointId;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// ALPN for the hub protocol.
-pub const HUB_ALPN: &[u8] = b"keeptalking/hub/1";
+/// ALPN for the SFU protocol.
+pub const SFU_ALPN: &[u8] = b"keeptalking/sfu/1";
 /// Largest presence blob a client may announce.
 pub const MAX_ANNOUNCE_LEN: usize = 16 * 1024;
 /// Largest payload a client may publish (one sealed envelope).
@@ -114,7 +114,7 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A frame sent by a client to the hub.
+/// A frame sent by a client to the SFU.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientFrame {
     Subscribe { topic: Topic },
@@ -131,7 +131,7 @@ pub struct Member {
     pub blob: Bytes,
 }
 
-/// A frame sent by the hub to a client.
+/// A frame sent by the SFU to a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerFrame {
     Snapshot {
@@ -315,7 +315,7 @@ impl ServerFrame {
     }
 }
 
-/// Builds a hub datagram: `topic ‖ payload`.
+/// Builds an SFU datagram: `topic ‖ payload`.
 pub fn datagram(topic: &Topic, payload: &[u8]) -> Bytes {
     let mut out = BytesMut::with_capacity(32 + payload.len());
     out.put_slice(topic.as_bytes());
@@ -323,7 +323,7 @@ pub fn datagram(topic: &Topic, payload: &[u8]) -> Bytes {
     out.freeze()
 }
 
-/// Splits a hub datagram into its topic and payload.
+/// Splits an SFU datagram into its topic and payload.
 pub fn split_datagram(mut datagram: Bytes) -> Option<(Topic, Bytes)> {
     let topic = take_topic(&mut datagram).ok()?;
     Some((topic, datagram))

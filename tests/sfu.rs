@@ -1,5 +1,5 @@
 //! End-to-end tests against an in-process `Sfu` on localhost: topic rooms,
-//! hub fan-out of publishes and datagrams, the info endpoint, and peer
+//! SFU fan-out of publishes and datagrams, the info endpoint, and peer
 //! connections carried by the embedded relay.
 
 use std::{net::Ipv4Addr, time::Duration};
@@ -7,7 +7,7 @@ use std::{net::Ipv4Addr, time::Duration};
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::Connection};
 use keeptalking_sfu::{
-    client::{ClientOptions, HubClient, bind_client},
+    client::{ClientOptions, SfuClient, bind_client},
     info,
     proto::{Member, ServerFrame, Topic},
     server::{Sfu, SfuConfig},
@@ -37,9 +37,9 @@ impl Harness {
             cert: dev.cert_config().unwrap(),
             public_relay_url: None,
             public_quic_port: None,
-            hub_bind: vec![local(0)],
-            hub_secret: SecretKey::generate(),
-            hub_ca: Some(dev.ca()),
+            sfu_bind: vec![local(0)],
+            sfu_secret: SecretKey::generate(),
+            sfu_ca: Some(dev.ca()),
         })
         .await
         .unwrap();
@@ -58,8 +58,8 @@ impl Harness {
         .unwrap()
     }
 
-    async fn hub(&self, endpoint: &Endpoint) -> (HubClient, mpsc::Receiver<ServerFrame>) {
-        HubClient::connect(endpoint, self.sfu.hub_addr())
+    async fn sfu_client(&self, endpoint: &Endpoint) -> (SfuClient, mpsc::Receiver<ServerFrame>) {
+        SfuClient::connect(endpoint, self.sfu.sfu_addr())
             .await
             .unwrap()
     }
@@ -97,7 +97,7 @@ async fn room_lifecycle() {
         h.endpoint(false).await,
     );
 
-    let (a, mut ra) = h.hub(&ea).await;
+    let (a, mut ra) = h.sfu_client(&ea).await;
     a.subscribe(topic).await.unwrap();
     assert_eq!(
         next(&mut ra).await,
@@ -107,7 +107,7 @@ async fn room_lifecycle() {
         }
     );
 
-    let (b, mut rb) = h.hub(&eb).await;
+    let (b, mut rb) = h.sfu_client(&eb).await;
     b.subscribe(topic).await.unwrap();
     assert_eq!(
         next(&mut rb).await,
@@ -148,7 +148,7 @@ async fn room_lifecycle() {
     );
 
     // A late joiner gets everyone's latest presence in its snapshot.
-    let (c, mut rc) = h.hub(&ec).await;
+    let (c, mut rc) = h.sfu_client(&ec).await;
     c.subscribe(topic).await.unwrap();
     let ServerFrame::Snapshot { members, .. } = next(&mut rc).await else {
         panic!("expected snapshot")
@@ -208,11 +208,11 @@ async fn newer_connection_owns_the_slot() {
     let topic = random_topic();
     let (ea, eb) = (h.endpoint(false).await, h.endpoint(false).await);
 
-    let (watcher, mut rw) = h.hub(&eb).await;
+    let (watcher, mut rw) = h.sfu_client(&eb).await;
     watcher.subscribe(topic).await.unwrap();
     next(&mut rw).await; // snapshot
 
-    let (old, mut ro) = h.hub(&ea).await;
+    let (old, mut ro) = h.sfu_client(&ea).await;
     old.subscribe(topic).await.unwrap();
     next(&mut ro).await;
     assert_eq!(
@@ -222,7 +222,7 @@ async fn newer_connection_owns_the_slot() {
 
     // Same endpoint reconnects (e.g. after a network change) before the old
     // connection has timed out.
-    let (new, mut rn) = h.hub(&ea).await;
+    let (new, mut rn) = h.sfu_client(&ea).await;
     new.subscribe(topic).await.unwrap();
     next(&mut rn).await;
     assert_eq!(
@@ -269,10 +269,10 @@ async fn publish_fans_out_to_the_room() {
         h.endpoint(false).await,
         h.endpoint(false).await,
     );
-    let (a, mut ra) = h.hub(&ea).await;
-    let (b, mut rb) = h.hub(&eb).await;
-    let (c, mut rc) = h.hub(&ec).await;
-    let (d, mut rd) = h.hub(&ed).await;
+    let (a, mut ra) = h.sfu_client(&ea).await;
+    let (b, mut rb) = h.sfu_client(&eb).await;
+    let (c, mut rc) = h.sfu_client(&ec).await;
+    let (d, mut rd) = h.sfu_client(&ed).await;
     for (client, rx) in [(&a, &mut ra), (&b, &mut rb), (&c, &mut rc)] {
         client.subscribe(topic).await.unwrap();
         next(rx).await; // snapshot
@@ -310,7 +310,7 @@ async fn publish_fans_out_to_the_room() {
     assert_quiet(&mut rb).await;
 }
 
-/// Datagrams sent to the hub reach the topic's other subscribers.
+/// Datagrams sent to the SFU reach the topic's other subscribers.
 #[tokio::test]
 async fn datagrams_fan_out_to_the_room() {
     let h = Harness::start().await;
@@ -320,9 +320,9 @@ async fn datagrams_fan_out_to_the_room() {
         h.endpoint(false).await,
         h.endpoint(false).await,
     );
-    let (a, mut ra) = h.hub(&ea).await;
-    let (b, mut rb) = h.hub(&eb).await;
-    let (c, mut rc) = h.hub(&ec).await;
+    let (a, mut ra) = h.sfu_client(&ea).await;
+    let (b, mut rb) = h.sfu_client(&eb).await;
+    let (c, mut rc) = h.sfu_client(&ec).await;
     for (client, rx) in [(&a, &mut ra), (&b, &mut rb), (&c, &mut rc)] {
         client.subscribe(topic).await.unwrap();
         next(rx).await;
@@ -346,19 +346,19 @@ async fn datagrams_fan_out_to_the_room() {
         }
     })
     .await;
-    assert!(got.is_ok(), "hub did not forward datagrams");
+    assert!(got.is_ok(), "SFU did not forward datagrams");
 }
 
-/// `GET /kt/hub` names the hub, the relay and the protocol.
+/// `GET /kt/sfu` names the SFU, the relay and the protocol.
 #[tokio::test]
-async fn info_endpoint_serves_hub_id() {
+async fn info_endpoint_serves_sfu_id() {
     let h = Harness::start().await;
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    let body = info::hub_info_json(
-        &h.sfu.hub_id().to_string(),
+    let body = info::sfu_info_json(
+        &h.sfu.sfu_id().to_string(),
         h.sfu.relay_url().as_str(),
         Some(7842),
     );
@@ -374,13 +374,13 @@ async fn info_endpoint_serves_hub_id() {
         stream.read_to_string(&mut out).await.unwrap();
         out
     };
-    let ok = get("/kt/hub").await;
+    let ok = get("/kt/sfu").await;
     assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
     assert!(
-        ok.contains(&format!(r#""hub":"{}""#, h.sfu.hub_id())),
+        ok.contains(&format!(r#""sfu":"{}""#, h.sfu.sfu_id())),
         "{ok}"
     );
-    assert!(ok.contains(r#""alpn":"keeptalking/hub/1""#), "{ok}");
+    assert!(ok.contains(r#""alpn":"keeptalking/sfu/1""#), "{ok}");
     assert!(ok.contains(r#""qad_port":7842"#), "{ok}");
     assert!(get("/other").await.starts_with("HTTP/1.1 404"));
 }

@@ -1,4 +1,4 @@
-//! Reference client for the hub protocol, used by `kt-probe` and the tests.
+//! Reference client for the SFU protocol, used by `kt-probe` and the tests.
 //! The Swift SDK implements the same thing on `iroh-ffi`
 //! (`Transport/Iroh/KeepTalkingIrohTransportHost.swift`).
 
@@ -12,7 +12,7 @@ use iroh::{
 use tokio::sync::{Mutex, mpsc};
 
 use crate::proto::{
-    ClientFrame, HUB_ALPN, ServerFrame, Topic, datagram, read_frame, split_datagram, write_frame,
+    ClientFrame, SFU_ALPN, ServerFrame, Topic, datagram, read_frame, split_datagram, write_frame,
 };
 
 /// How a client endpoint is configured: our relay only, no DNS/DHT address
@@ -45,25 +45,25 @@ pub async fn bind_client(options: ClientOptions) -> Result<Endpoint> {
         .map_err(|err| anyhow!("bind endpoint: {err:?}"))
 }
 
-/// A session with the hub over one QUIC connection: subscriptions,
-/// presence, hub-delivered publishes and datagrams.
-pub struct HubClient {
+/// A session with the SFU over one QUIC connection: subscriptions,
+/// presence, SFU-delivered publishes and datagrams.
+pub struct SfuClient {
     conn: Connection,
     send: Mutex<SendStream>,
 }
 
-impl HubClient {
+impl SfuClient {
     /// Connects and returns the client plus the stream of server frames.
     /// The receiver closes when the connection ends.
     pub async fn connect(
         endpoint: &Endpoint,
-        hub: EndpointAddr,
+        sfu: EndpointAddr,
     ) -> Result<(Self, mpsc::Receiver<ServerFrame>)> {
         let conn = endpoint
-            .connect(hub, HUB_ALPN)
+            .connect(sfu, SFU_ALPN)
             .await
-            .map_err(|err| anyhow!("connect to hub: {err:?}"))?;
-        let (send, mut recv) = conn.open_bi().await.context("open hub stream")?;
+            .map_err(|err| anyhow!("connect to sfu: {err:?}"))?;
+        let (send, mut recv) = conn.open_bi().await.context("open sfu stream")?;
         let (tx, rx) = mpsc::channel(256);
         tokio::spawn(async move {
             while let Ok(Some((tag, body))) = read_frame(&mut recv).await {
@@ -107,10 +107,10 @@ impl HubClient {
     pub fn send_datagram(&self, topic: &Topic, payload: &[u8]) -> Result<()> {
         self.conn
             .send_datagram(datagram(topic, payload))
-            .map_err(|err| anyhow!("hub datagram: {err:?}"))
+            .map_err(|err| anyhow!("sfu datagram: {err:?}"))
     }
 
-    /// Next datagram forwarded by the hub.
+    /// Next datagram forwarded by the SFU.
     pub async fn read_datagram(&self) -> Result<(Topic, Bytes)> {
         loop {
             let raw = self.conn.read_datagram().await?;
@@ -131,7 +131,7 @@ impl HubClient {
     async fn send(&self, frame: ClientFrame) -> Result<()> {
         let mut send = self.send.lock().await;
         if self.conn.close_reason().is_some() {
-            bail!("hub connection closed");
+            bail!("sfu connection closed");
         }
         write_frame(&mut *send, &frame.encode()).await
     }

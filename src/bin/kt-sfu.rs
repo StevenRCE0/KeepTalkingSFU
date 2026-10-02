@@ -1,4 +1,4 @@
-//! `kt-sfu`: KeepTalking hub (presence + topic fan-out) with an embedded iroh
+//! `kt-sfu`: KeepTalking SFU (presence + topic fan-out) with an embedded iroh
 //! relay.
 
 use std::{net::SocketAddr, path::PathBuf, sync::atomic::Ordering, time::Duration};
@@ -16,7 +16,7 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(
     name = "kt-sfu",
-    about = "KeepTalking hub (topic rooms + fan-out) + embedded iroh relay"
+    about = "KeepTalking SFU (topic rooms + fan-out) + embedded iroh relay"
 )]
 struct Args {
     /// Plain-HTTP listener for captive-portal probes.
@@ -66,21 +66,21 @@ struct Args {
     #[arg(long, env = "KT_SFU_PUBLIC_QUIC_PORT")]
     public_quic_port: Option<u16>,
 
-    /// UDP socket(s) for the hub endpoint. Repeatable.
+    /// UDP socket(s) for the SFU endpoint. Repeatable.
     #[arg(
-        long = "hub-bind",
-        env = "KT_SFU_HUB_BIND",
+        long = "sfu-bind",
+        env = "KT_SFU_BIND",
         value_delimiter = ',',
         default_value = "[::]:9702"
     )]
-    hub_bind: Vec<SocketAddr>,
+    sfu_bind: Vec<SocketAddr>,
 
-    /// File holding the hub's 32-byte secret key; created if missing. The
-    /// hub id must stay stable because clients pin it.
-    #[arg(long, env = "KT_SFU_HUB_KEY", default_value = "kt-sfu-hub.key")]
-    hub_key: PathBuf,
+    /// File holding the SFU endpoint's 32-byte secret key; created if missing. The
+    /// SFU id must stay stable because clients pin it.
+    #[arg(long, env = "KT_SFU_KEY", default_value = "kt-sfu.key")]
+    sfu_key: PathBuf,
 
-    /// Plain-HTTP listener for `GET /kt/hub` (hub id, relay, ALPN, QAD port).
+    /// Plain-HTTP listener for `GET /kt/sfu` (SFU id, relay, ALPN, QAD port).
     /// Put it behind the TLS proxy at the relay's domain.
     #[arg(long, env = "KT_SFU_INFO_BIND")]
     info_bind: Option<SocketAddr>,
@@ -96,8 +96,8 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let hub_secret = load_or_create_key(&args.hub_key).await?;
-    let (cert, hub_ca) = if args.dev {
+    let sfu_secret = load_or_create_key(&args.sfu_key).await?;
+    let (cert, sfu_ca) = if args.dev {
         let dev = DevCert::generate(&args.dev_hosts)?;
         tokio::fs::write(&args.dev_cert_out, &dev.cert_pem)
             .await
@@ -118,15 +118,15 @@ async fn main() -> Result<()> {
         cert,
         public_relay_url: args.public_relay_url,
         public_quic_port: args.public_quic_port,
-        hub_bind: args.hub_bind,
-        hub_secret,
-        hub_ca,
+        sfu_bind: args.sfu_bind,
+        sfu_secret,
+        sfu_ca,
     })
     .await?;
 
-    println!("hub id     {}", sfu.hub_id());
+    println!("sfu id     {}", sfu.sfu_id());
     println!("relay url  {}", sfu.relay_url());
-    println!("hub udp    {:?}", sfu.hub_sockets());
+    println!("sfu udp    {:?}", sfu.sfu_sockets());
     if let Some(addr) = sfu.relay_quic_addr() {
         println!("qad udp    {addr}");
     }
@@ -141,8 +141,8 @@ async fn main() -> Result<()> {
         extra.push_str(&format!(" --relay-ca {}", args.dev_cert_out.display()));
     }
     println!(
-        "probe      kt-probe room --hub {} --relay {}{extra} --context <uuid>",
-        sfu.hub_id(),
+        "probe      kt-probe room --sfu {} --relay {}{extra} --context <uuid>",
+        sfu.sfu_id(),
         sfu.relay_url()
     );
 
@@ -150,13 +150,13 @@ async fn main() -> Result<()> {
         let listener = tokio::net::TcpListener::bind(bind)
             .await
             .with_context(|| format!("info listener {bind}"))?;
-        let body = info::hub_info_json(
-            &sfu.hub_id().to_string(),
+        let body = info::sfu_info_json(
+            &sfu.sfu_id().to_string(),
             sfu.relay_url().as_str(),
             args.public_quic_port
                 .or(sfu.relay_quic_addr().map(|addr| addr.port())),
         );
-        println!("info       http://{bind}/kt/hub");
+        println!("info       http://{bind}/kt/sfu");
         tokio::spawn(async move {
             if let Err(err) = info::serve(listener, body).await {
                 tracing::error!("info listener stopped: {err:#}");
@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
                     delivered = now.1,
                     datagrams_in = now.2,
                     datagrams_out = now.3,
-                    "hub totals"
+                    "sfu totals"
                 );
                 last = now;
             }
@@ -208,7 +208,7 @@ async fn load_or_create_key(path: &PathBuf) -> Result<SecretKey> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let key = SecretKey::generate();
             write_private(path, &key.to_bytes()).await?;
-            info!(path = %path.display(), "generated hub key");
+            info!(path = %path.display(), "generated sfu key");
             Ok(key)
         }
         Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),

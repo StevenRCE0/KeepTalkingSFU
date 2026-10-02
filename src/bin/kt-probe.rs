@@ -1,10 +1,10 @@
-//! `kt-probe`: subscribes to a topic on a `kt-sfu` hub and measures both
+//! `kt-probe`: subscribes to a topic on `kt-sfu` and measures both
 //! delivery paths with every other probe in it:
 //!
 //! - **Mesh:** a direct iroh connection per peer — time to connect,
 //!   relay → direct upgrade, RTT, pings and datagram echoes.
-//! - **Hub:** pings published through the hub (every other probe answers
-//!   through the hub) and datagrams fanned out by the hub.
+//! - **SFU:** pings published through the SFU (every other probe answers
+//!   through the SFU) and datagrams fanned out by the SFU.
 //!
 //! Run the same command on two or more machines with the same `--context`.
 
@@ -27,7 +27,7 @@ use iroh::{
 };
 use iroh_relay::RelayQuicConfig;
 use keeptalking_sfu::{
-    client::{ClientOptions, HubClient, bind_client},
+    client::{ClientOptions, SfuClient, bind_client},
     proto::{ServerFrame, Topic},
     tls::ca_from_pem_file,
 };
@@ -43,7 +43,7 @@ const BLOB_MAGIC: &[u8] = b"kt-probe/1:";
 #[derive(Parser, Debug)]
 #[command(
     name = "kt-probe",
-    about = "Probe a kt-sfu: hub fan-out + full-mesh peer connections"
+    about = "Probe a kt-sfu: SFU fan-out + full-mesh peer connections"
 )]
 enum Command {
     /// Subscribe to a topic and connect to every other probe in it.
@@ -52,9 +52,9 @@ enum Command {
 
 #[derive(Parser, Debug)]
 struct RoomArgs {
-    /// Hub endpoint id printed by kt-sfu.
+    /// SFU endpoint id printed by kt-sfu.
     #[arg(long)]
-    hub: EndpointId,
+    sfu: EndpointId,
     /// Relay URL printed by kt-sfu.
     #[arg(long)]
     relay: RelayUrl,
@@ -122,14 +122,14 @@ async fn room(args: RoomArgs) -> Result<()> {
     println!("me       {me}");
     println!("topic    {topic}");
 
-    let hub_addr = EndpointAddr::new(args.hub).with_relay_url(args.relay.clone());
-    let (hub, mut frames) = HubClient::connect(&endpoint, hub_addr).await?;
-    let hub = Arc::new(hub);
-    println!("hub      connected in {:?}", started.elapsed());
-    hub.subscribe(topic).await?;
+    let sfu_addr = EndpointAddr::new(args.sfu).with_relay_url(args.relay.clone());
+    let (sfu, mut frames) = SfuClient::connect(&endpoint, sfu_addr).await?;
+    let sfu = Arc::new(sfu);
+    println!("sfu      connected in {:?}", started.elapsed());
+    sfu.subscribe(topic).await?;
     let mut blob = BytesMut::from(BLOB_MAGIC);
     blob.put_slice(me.as_bytes());
-    hub.announce(topic, blob.freeze()).await?;
+    sfu.announce(topic, blob.freeze()).await?;
 
     let mesh = Arc::new(Mesh {
         endpoint: endpoint.clone(),
@@ -142,8 +142,8 @@ async fn room(args: RoomArgs) -> Result<()> {
     });
     tokio::spawn(accept_loop(mesh.clone()));
     tokio::spawn(status_loop(mesh.clone()));
-    tokio::spawn(hub_ping_loop(mesh.clone(), hub.clone(), topic));
-    tokio::spawn(hub_datagram_reader(mesh.clone(), hub.clone()));
+    tokio::spawn(sfu_ping_loop(mesh.clone(), sfu.clone(), topic));
+    tokio::spawn(sfu_datagram_reader(mesh.clone(), sfu.clone()));
 
     let deadline = async {
         if args.duration > 0.0 {
@@ -157,23 +157,23 @@ async fn room(args: RoomArgs) -> Result<()> {
         tokio::select! {
             frame = frames.recv() => {
                 let Some(frame) = frame else {
-                    println!("hub      connection closed");
+                    println!("sfu      connection closed");
                     break;
                 };
-                handle_frame(&mesh, &hub, topic, frame).await;
+                handle_frame(&mesh, &sfu, topic, frame).await;
             }
             _ = tokio::signal::ctrl_c() => break,
             _ = &mut deadline => break,
         }
     }
 
-    hub.close();
+    sfu.close();
     endpoint.close().await;
     mesh.print_summary();
     Ok(())
 }
 
-async fn handle_frame(mesh: &Arc<Mesh>, hub: &HubClient, topic: Topic, frame: ServerFrame) {
+async fn handle_frame(mesh: &Arc<Mesh>, sfu: &SfuClient, topic: Topic, frame: ServerFrame) {
     match frame {
         ServerFrame::Snapshot { members, .. } => {
             println!("room     snapshot: {} other member(s)", members.len());
@@ -187,8 +187,8 @@ async fn handle_frame(mesh: &Arc<Mesh>, hub: &HubClient, topic: Topic, frame: Se
             println!("room     - {}", id.fmt_short());
             mesh.forget(id);
         }
-        ServerFrame::Deliver { payload, .. } => mesh.hub_message(hub, topic, payload).await,
-        ServerFrame::Error { reason } => println!("hub      error: {reason}"),
+        ServerFrame::Deliver { payload, .. } => mesh.sfu_message(sfu, topic, payload).await,
+        ServerFrame::Error { reason } => println!("sfu      error: {reason}"),
     }
 }
 
@@ -218,11 +218,11 @@ struct PeerStats {
     pings_ok: AtomicU64,
     dgrams_sent: AtomicU64,
     dgrams_echoed: AtomicU64,
-    /// Round trip of our latest hub ping, answered by this peer via the hub.
-    hub_rtt: Mutex<Option<Duration>>,
-    hub_pongs: AtomicU64,
-    /// Hub-forwarded datagrams received from this peer.
-    hub_dgrams: AtomicU64,
+    /// Round trip of our latest SFU ping, answered by this peer via the SFU.
+    sfu_rtt: Mutex<Option<Duration>>,
+    sfu_pongs: AtomicU64,
+    /// SFU-forwarded datagrams received from this peer.
+    sfu_dgrams: AtomicU64,
 }
 
 impl Mesh {
@@ -246,7 +246,7 @@ impl Mesh {
             );
             return;
         }
-        // Hub traffic can create a peer's entry before its presence arrives,
+        // SFU traffic can create a peer's entry before its presence arrives,
         // so "learned" is the presence timestamp, not the entry.
         let stats = {
             let mut peers = self.peers.lock().unwrap();
@@ -272,9 +272,9 @@ impl Mesh {
         }
     }
 
-    /// A payload the hub fanned out to us: a ping to answer or a pong to
+    /// A payload the SFU fanned out to us: a ping to answer or a pong to
     /// time. `P ‖ from ‖ seq ‖ t_ns` / `Q ‖ to ‖ from ‖ seq ‖ t_ns`.
-    async fn hub_message(&self, hub: &HubClient, topic: Topic, mut payload: Bytes) {
+    async fn sfu_message(&self, sfu: &SfuClient, topic: Topic, mut payload: Bytes) {
         if payload.remaining() < 1 {
             return;
         }
@@ -286,7 +286,7 @@ impl Mesh {
                 pong.put_slice(&from);
                 pong.put_slice(self.me.as_bytes());
                 pong.put_slice(&payload);
-                let _ = hub.publish(topic, pong.freeze()).await;
+                let _ = sfu.publish(topic, pong.freeze()).await;
             }
             b'Q' if payload.remaining() >= 80 => {
                 let to = payload.split_to(32);
@@ -303,8 +303,8 @@ impl Mesh {
                     .since_start()
                     .saturating_sub(Duration::from_nanos(sent_ns));
                 let stats = self.peers.lock().unwrap().entry(from).or_default().clone();
-                *stats.hub_rtt.lock().unwrap() = Some(rtt);
-                stats.hub_pongs.fetch_add(1, Ordering::Relaxed);
+                *stats.sfu_rtt.lock().unwrap() = Some(rtt);
+                stats.sfu_pongs.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -371,9 +371,9 @@ impl Mesh {
     }
 }
 
-/// Every tick: one ping published through the hub (all other probes answer
-/// through the hub) and one datagram the hub fans out.
-async fn hub_ping_loop(mesh: Arc<Mesh>, hub: Arc<HubClient>, topic: Topic) {
+/// Every tick: one ping published through the SFU (all other probes answer
+/// through the SFU) and one datagram the SFU fans out.
+async fn sfu_ping_loop(mesh: Arc<Mesh>, sfu: Arc<SfuClient>, topic: Topic) {
     let mut tick = tokio::time::interval(mesh.interval);
     let mut seq = 0u64;
     loop {
@@ -385,18 +385,18 @@ async fn hub_ping_loop(mesh: Arc<Mesh>, hub: Arc<HubClient>, topic: Topic) {
         ping.put_slice(mesh.me.as_bytes());
         ping.put_u64(seq);
         ping.put_u64(sent_ns);
-        if hub.publish(topic, ping.freeze()).await.is_err() {
+        if sfu.publish(topic, ping.freeze()).await.is_err() {
             return;
         }
         let mut dg = BytesMut::with_capacity(40);
         dg.put_slice(mesh.me.as_bytes());
         dg.put_u64(seq);
-        let _ = hub.send_datagram(&topic, &dg);
+        let _ = sfu.send_datagram(&topic, &dg);
     }
 }
 
-async fn hub_datagram_reader(mesh: Arc<Mesh>, hub: Arc<HubClient>) {
-    while let Ok((_, payload)) = hub.read_datagram().await {
+async fn sfu_datagram_reader(mesh: Arc<Mesh>, sfu: Arc<SfuClient>) {
+    while let Ok((_, payload)) = sfu.read_datagram().await {
         if payload.len() < 32 {
             continue;
         }
@@ -405,7 +405,7 @@ async fn hub_datagram_reader(mesh: Arc<Mesh>, hub: Arc<HubClient>) {
             continue;
         };
         let stats = mesh.peers.lock().unwrap().entry(from).or_default().clone();
-        stats.hub_dgrams.fetch_add(1, Ordering::Relaxed);
+        stats.sfu_dgrams.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -566,17 +566,17 @@ async fn echo_loop(conn: &Connection) -> Result<()> {
 
 impl PeerStats {
     fn traffic(&self) -> String {
-        let hub = format!(
-            "hub rtt {} x{} dgrams {}",
-            fmt_opt(*self.hub_rtt.lock().unwrap()),
-            self.hub_pongs.load(Ordering::Relaxed),
-            self.hub_dgrams.load(Ordering::Relaxed),
+        let sfu = format!(
+            "sfu rtt {} x{} dgrams {}",
+            fmt_opt(*self.sfu_rtt.lock().unwrap()),
+            self.sfu_pongs.load(Ordering::Relaxed),
+            self.sfu_dgrams.load(Ordering::Relaxed),
         );
         if !self.initiator.load(Ordering::Relaxed) {
-            return format!("echoing  {hub}");
+            return format!("echoing  {sfu}");
         }
         format!(
-            "ping {} x{}  dgrams {}/{}  {hub}",
+            "ping {} x{}  dgrams {}/{}  {sfu}",
             fmt_opt(*self.last_ping.lock().unwrap()),
             self.pings_ok.load(Ordering::Relaxed),
             self.dgrams_echoed.load(Ordering::Relaxed),

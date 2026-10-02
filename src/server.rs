@@ -1,6 +1,6 @@
-//! The service: an embedded iroh relay plus a hub endpoint that keeps one
-//! room per topic. The hub relays presence blobs and, for senders that pick
-//! hub delivery, fans each published payload (and datagram) out to the rest
+//! The service: an embedded iroh relay plus an SFU endpoint that keeps one
+//! room per topic. The SFU relays presence blobs and, for senders that pick
+//! SFU delivery, fans each published payload (and datagram) out to the rest
 //! of the room. Peers that pick mesh delivery talk over their own iroh
 //! connections, relayed through the embedded relay until they go direct.
 
@@ -28,7 +28,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, info, warn};
 
 use crate::proto::{
-    ClientFrame, HUB_ALPN, MAX_ANNOUNCE_LEN, MAX_PUBLISH_LEN, Member, ServerFrame, Topic,
+    ClientFrame, MAX_ANNOUNCE_LEN, MAX_PUBLISH_LEN, Member, SFU_ALPN, ServerFrame, Topic,
     read_frame, split_datagram, write_frame,
 };
 
@@ -50,16 +50,16 @@ pub struct SfuConfig {
     pub public_relay_url: Option<RelayUrl>,
     /// QAD port clients use. Defaults to the bound QUIC port.
     pub public_quic_port: Option<u16>,
-    /// UDP sockets for the hub endpoint. Empty = OS default.
-    pub hub_bind: Vec<SocketAddr>,
-    pub hub_secret: SecretKey,
-    /// Trust anchors the hub uses to reach its own relay. `None` = web PKI.
-    pub hub_ca: Option<CaTlsConfig>,
+    /// UDP sockets for the SFU endpoint. Empty = OS default.
+    pub sfu_bind: Vec<SocketAddr>,
+    pub sfu_secret: SecretKey,
+    /// Trust anchors the SFU uses to reach its own relay. `None` = web PKI.
+    pub sfu_ca: Option<CaTlsConfig>,
 }
 
 pub struct Sfu {
     relay: RelayServer,
-    hub: Endpoint,
+    endpoint: Endpoint,
     relay_url: RelayUrl,
     relay_map: RelayMap,
     rooms: Arc<Rooms>,
@@ -101,30 +101,30 @@ impl Sfu {
         let relay_map: RelayMap =
             iroh::RelayConfig::new(relay_url.clone(), quic_port.map(RelayQuicConfig::new)).into();
 
-        let mut hub = Endpoint::builder(presets::Minimal)
-            .secret_key(config.hub_secret)
-            .alpns(vec![HUB_ALPN.to_vec()])
+        let mut endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(config.sfu_secret)
+            .alpns(vec![SFU_ALPN.to_vec()])
             .relay_mode(RelayMode::Custom(relay_map.clone()));
-        if let Some(ca) = config.hub_ca {
-            hub = hub.ca_tls_config(ca);
+        if let Some(ca) = config.sfu_ca {
+            endpoint = endpoint.ca_tls_config(ca);
         }
-        for addr in config.hub_bind {
-            hub = hub
+        for addr in config.sfu_bind {
+            endpoint = endpoint
                 .bind_addr(addr)
-                .map_err(|err| anyhow!("hub bind {addr}: {err:?}"))?;
+                .map_err(|err| anyhow!("sfu bind {addr}: {err:?}"))?;
         }
-        let hub = hub
+        let endpoint = endpoint
             .bind()
             .await
-            .map_err(|err| anyhow!("hub endpoint: {err:?}"))?;
+            .map_err(|err| anyhow!("sfu endpoint: {err:?}"))?;
 
         let rooms = Arc::new(Rooms::default());
         let stats = Arc::new(Stats::default());
-        let accept_task = tokio::spawn(accept_loop(hub.clone(), rooms.clone(), stats.clone()));
-        info!(hub = %hub.id(), relay = %relay_url, "sfu up");
+        let accept_task = tokio::spawn(accept_loop(endpoint.clone(), rooms.clone(), stats.clone()));
+        info!(sfu = %endpoint.id(), relay = %relay_url, "sfu up");
         Ok(Self {
             relay,
-            hub,
+            endpoint,
             relay_url,
             relay_map,
             rooms,
@@ -133,14 +133,14 @@ impl Sfu {
         })
     }
 
-    pub fn hub_id(&self) -> EndpointId {
-        self.hub.id()
+    pub fn sfu_id(&self) -> EndpointId {
+        self.endpoint.id()
     }
 
-    /// The hub address clients dial: its id plus the relay. Direct paths
+    /// The SFU address clients dial: its id plus the relay. Direct paths
     /// are discovered by iroh once connected.
-    pub fn hub_addr(&self) -> EndpointAddr {
-        EndpointAddr::new(self.hub.id()).with_relay_url(self.relay_url.clone())
+    pub fn sfu_addr(&self) -> EndpointAddr {
+        EndpointAddr::new(self.endpoint.id()).with_relay_url(self.relay_url.clone())
     }
 
     pub fn relay_url(&self) -> &RelayUrl {
@@ -159,8 +159,8 @@ impl Sfu {
         self.relay.quic_addr()
     }
 
-    pub fn hub_sockets(&self) -> Vec<SocketAddr> {
-        self.hub.bound_sockets()
+    pub fn sfu_sockets(&self) -> Vec<SocketAddr> {
+        self.endpoint.bound_sockets()
     }
 
     /// Current subscribers of a topic, for diagnostics and tests.
@@ -189,7 +189,7 @@ impl Sfu {
 
     pub async fn shutdown(self) -> Result<()> {
         self.accept_task.abort();
-        self.hub.close().await;
+        self.endpoint.close().await;
         self.relay
             .shutdown()
             .await
@@ -197,8 +197,8 @@ impl Sfu {
     }
 }
 
-async fn accept_loop(hub: Endpoint, rooms: Arc<Rooms>, stats: Arc<Stats>) {
-    while let Some(incoming) = hub.accept().await {
+async fn accept_loop(endpoint: Endpoint, rooms: Arc<Rooms>, stats: Arc<Stats>) {
+    while let Some(incoming) = endpoint.accept().await {
         let rooms = rooms.clone();
         let stats = stats.clone();
         tokio::spawn(async move {
@@ -223,7 +223,7 @@ async fn serve_connection(conn: Connection, rooms: &Arc<Rooms>, stats: &Arc<Stat
     let peer = conn.remote_id();
     let conn_id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
     let (mut send, mut recv) = conn.accept_bi().await?;
-    debug!(peer = %peer.fmt_short(), conn_id, "hub stream open");
+    debug!(peer = %peer.fmt_short(), conn_id, "sfu stream open");
 
     let (tx, mut rx) = mpsc::channel::<Bytes>(OUTBOX_CAPACITY);
     let writer = tokio::spawn(async move {

@@ -31,4 +31,4 @@ USER 65532:65532
 EXPOSE 8080/tcp 8443/tcp 7842/udp 9702/udp
 ENTRYPOINT ["/usr/local/bin/kt-sfu"]
 CMD ["--relay-http-bind", "[::]:8080", "--relay-https-bind", "[::]:8443", \
-     "--relay-quic-bind", "[::]:7842", "--hub-bind", "[::]:9702"]
+     "--relay-quic-bind", "[::]:7842", "--sfu-bind", "[::]:9702"]
