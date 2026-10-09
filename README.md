@@ -15,7 +15,19 @@ This replaced the Swift SFU on `main` (2026-10-02). The Swift SFU's history is k
 | Path | What |
 |---|---|
 | `src/proto.rs` | SFU wire format: frames, datagrams, limits. The protocol reference is in the module docs. |
-| `src/server.rs` | `Sfu`: embedded relay, SFU endpoint, rooms, the session and lane streams, publish (fan-out and directed) and datagram forwarding, and the resource bounds (`Limits`). |
+| `src/server/mod.rs` | `Sfu` and `SfuConfig`: starts the embedded relay and the SFU endpoint (QUIC transport bounds), accessors, shutdown. The module docs describe streams and resource bounds. |
+| `src/server/connection.rs` | Accept loop, connection cap, and per-connection setup and teardown (readers, writers, queues). |
+| `src/server/stats.rs` | `Stats` counters and their `StatsSnapshot`. |
+| `src/server/rooms/registry.rs` | Sharded rooms: membership, snapshots, presence, fan-out and directed delivery. |
+| `src/server/rooms/session.rs` | Session stream reader: SUBSCRIBE, UNSUBSCRIBE, ANNOUNCE. |
+| `src/server/rooms/session_writer.rs` | Session stream writer: ERROR/JOINED/LEFT/PRESENCE frames and chunked snapshots. |
+| `src/server/data_channels/readers.rs` | Lane stream readers and the shared publish path (PUBLISH, PUBLISH_TO). |
+| `src/server/data_channels/queues.rs` | Per-client queues: the shared DELIVER encoding, the slow-consumer byte budget, `MemberHandle`. |
+| `src/server/data_channels/writers.rs` | Control and interactive lane writers, plus the stall-bounded chunk write. |
+| `src/server/data_channels/bulk.rs` | Bulk lane: the dropping, acknowledgement-counted queue and the one-stream-per-delivery dispatcher. |
+| `src/server/voice/datagrams.rs` | Datagram (voice) fan-out. |
+| `src/server/limits/config.rs` | `Limits`, `Rate` and `RelayRateLimit`: every tunable bound, with the production defaults. |
+| `src/server/limits/rate_limiter.rs` | The token bucket behind the per-connection rate limits. |
 | `src/info.rs` | The one-route HTTP listener behind `/kt/sfu`, and `fetch_info`, its client. |
 | `src/client.rs` | Reference SFU client plus client endpoint setup. The Swift SDK mirrors it on `iroh-ffi`. |
 | `src/tls.rs` | PEM loading (reloaded for cert-manager) and self-signed dev certs. |
