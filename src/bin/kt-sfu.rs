@@ -10,7 +10,9 @@ use keeptalking_sfu::{
     info,
     server::{Limits, RelayRateLimit, Sfu, SfuConfig, StatsSnapshot},
     tls::{DevCert, reloading_cert},
+    wake::{WakeConfig, apns::ApnsConfig},
 };
+use rustls::pki_types::{PrivatePkcs8KeyDer, pem::PemObject};
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -98,6 +100,27 @@ struct Args {
     /// Concurrent SFU connections; handshakes beyond it are refused.
     #[arg(long, env = "KT_SFU_MAX_CONNECTIONS", default_value_t = 10_000)]
     max_connections: usize,
+
+    /// APNs token key (`AuthKey_<KEYID>.p8`). With --apns-key-id and
+    /// --apns-team-id it turns on push wakes (`keeptalking/wake/1`).
+    #[arg(
+        long,
+        env = "KT_SFU_APNS_KEY",
+        requires_all = ["apns_key_id", "apns_team_id", "wake_secret"]
+    )]
+    apns_key: Option<PathBuf>,
+
+    #[arg(long, env = "KT_SFU_APNS_KEY_ID", requires = "apns_key")]
+    apns_key_id: Option<String>,
+
+    #[arg(long, env = "KT_SFU_APNS_TEAM_ID", requires = "apns_key")]
+    apns_team_id: Option<String>,
+
+    /// File holding the secret wake handles are sealed with; created if
+    /// missing. Keep it with --sfu-key: losing it orphans every handle
+    /// devices have handed out.
+    #[arg(long, env = "KT_SFU_WAKE_SECRET", requires = "apns_key")]
+    wake_secret: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -111,6 +134,26 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let sfu_secret = load_or_create_key(&args.sfu_key).await?;
+    let wake = match (
+        &args.apns_key,
+        &args.apns_key_id,
+        &args.apns_team_id,
+        &args.wake_secret,
+    ) {
+        (Some(key), Some(key_id), Some(team_id), Some(wake_secret)) => {
+            let key = PrivatePkcs8KeyDer::from_pem_file(key)
+                .with_context(|| format!("reading the APNs key {}", key.display()))?;
+            Some(WakeConfig {
+                handle_secret: load_or_create_secret(wake_secret).await?,
+                apns: ApnsConfig::new(
+                    key_id.clone(),
+                    team_id.clone(),
+                    key.secret_pkcs8_der().to_vec(),
+                ),
+            })
+        }
+        _ => None,
+    };
     let (cert, sfu_ca) = if args.dev {
         let dev = DevCert::generate(&args.dev_hosts)?;
         tokio::fs::write(&args.dev_cert_out, &dev.cert_pem)
@@ -143,6 +186,7 @@ async fn main() -> Result<()> {
             max_connections: args.max_connections,
             ..Limits::default()
         },
+        wake,
     })
     .await?;
 
@@ -249,6 +293,19 @@ async fn load_or_create_key(path: &PathBuf) -> Result<SecretKey> {
             write_private(path, &key.to_bytes()).await?;
             info!(path = %path.display(), "generated sfu key");
             Ok(key)
+        }
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+async fn load_or_create_secret(path: &PathBuf) -> Result<Vec<u8>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let secret = SecretKey::generate().to_bytes().to_vec();
+            write_private(path, &secret).await?;
+            info!(path = %path.display(), "generated wake handle secret");
+            Ok(secret)
         }
         Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
     }

@@ -777,6 +777,15 @@ const READ_STEP: usize = 64 * 1024;
 /// them with [`ClientFrame::decode`] / [`ServerFrame::decode`] and skip the
 /// frame if that fails.
 pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<(u8, Bytes)>> {
+    read_frame_up_to(recv, MAX_FRAME_LEN).await
+}
+
+/// [`read_frame`] with a smaller length cap, for streams whose frames are
+/// all small.
+pub async fn read_frame_up_to<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    max_len: usize,
+) -> Result<Option<(u8, Bytes)>> {
     let mut len = [0u8; 4];
     match recv.read_exact(&mut len).await {
         Ok(_) => {}
@@ -784,7 +793,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<(u8
         Err(err) => return Err(err.into()),
     }
     let len = u32::from_be_bytes(len) as usize;
-    if !(1..=MAX_FRAME_LEN).contains(&len) {
+    if !(1..=max_len).contains(&len) {
         return Err(FrameLengthError(len).into());
     }
     // Grow the buffer as bytes arrive instead of trusting the declared

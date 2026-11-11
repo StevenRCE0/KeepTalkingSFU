@@ -48,6 +48,7 @@ mod limits;
 mod rooms;
 mod stats;
 mod voice;
+mod wake;
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -70,7 +71,10 @@ use tracing::info;
 pub use limits::config::{Limits, Rate, RelayRateLimit};
 pub use stats::{LaneCounts, Stats, StatsSnapshot};
 
-use crate::proto::{SFU_ALPN, Topic};
+use crate::{
+    proto::{SFU_ALPN, Topic},
+    wake::{WAKE_ALPN, Wake, WakeConfig},
+};
 use connection::accept_loop;
 use limits::config::MIB;
 use rooms::registry::Rooms;
@@ -113,6 +117,8 @@ pub struct SfuConfig {
     /// Trust anchors the SFU uses to reach its own relay. `None` = web PKI.
     pub sfu_ca: Option<CaTlsConfig>,
     pub limits: Limits,
+    /// Push wakes over APNs on [`WAKE_ALPN`]. `None` = not offered.
+    pub wake: Option<WakeConfig>,
 }
 
 pub struct Sfu {
@@ -129,6 +135,7 @@ struct Shared {
     rooms: Rooms,
     stats: Arc<Stats>,
     limits: Limits,
+    wake: Option<Arc<Wake>>,
 }
 
 impl Sfu {
@@ -170,9 +177,14 @@ impl Sfu {
             .send_window((limits.bulk_outbox_bytes + QUIC_SEND_WINDOW_HEADROOM) as u64)
             .datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER))
             .build();
+        let wake = config.wake.map(Wake::new).transpose()?.map(Arc::new);
+        let mut alpns = vec![SFU_ALPN.to_vec()];
+        if wake.is_some() {
+            alpns.push(WAKE_ALPN.to_vec());
+        }
         let mut endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(config.sfu_secret)
-            .alpns(vec![SFU_ALPN.to_vec()])
+            .alpns(alpns)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
             .transport_config(transport);
         if let Some(ca) = config.sfu_ca {
@@ -192,6 +204,7 @@ impl Sfu {
             rooms: Rooms::new(&config.limits),
             stats: Arc::new(Stats::default()),
             limits: config.limits,
+            wake,
         });
         let accept_task = tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
         info!(sfu = %endpoint.id(), relay = %relay_url, "sfu up");

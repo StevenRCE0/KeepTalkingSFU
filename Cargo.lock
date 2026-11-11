@@ -1645,13 +1645,20 @@ name = "keeptalking-sfu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iroh",
  "iroh-relay",
  "n0-future",
  "rcgen",
+ "reqwest",
+ "ring",
  "rustls",
+ "serde_json",
  "sha2",
  "tokio",
  "tokio-rustls",
@@ -1659,6 +1666,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2626,6 +2634,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",

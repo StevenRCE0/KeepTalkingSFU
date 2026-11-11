@@ -18,3 +18,4 @@ pub mod info;
 pub mod proto;
 pub mod server;
 pub mod tls;
+pub mod wake;

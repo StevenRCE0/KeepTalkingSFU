@@ -73,6 +73,9 @@ pub struct Limits {
     pub join_rate: Rate,
     /// Datagrams a connection may send for fan-out.
     pub datagram_rate: Rate,
+    /// MINT and SEND frames on a wake connection. The burst covers one
+    /// message waking every other member of a full group.
+    pub wake_rate: Rate,
 }
 
 impl Default for Limits {
@@ -108,6 +111,12 @@ impl Default for Limits {
                 burst_bytes: (2 * MIB) as f64,
                 frames_per_second: 1000.0,
                 burst_frames: 2000.0,
+            },
+            wake_rate: Rate {
+                bytes_per_second: (64 * 1024) as f64,
+                burst_bytes: (512 * 1024) as f64,
+                frames_per_second: 5.0,
+                burst_frames: 128.0,
             },
         }
     }

@@ -8,20 +8,30 @@ description = "KeepTalking presence service with an embedded iroh relay."
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 iroh = "1.2"
 iroh-relay = { version = "1.2", features = ["server"] }
 n0-future = "0.3"
 rcgen = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls-no-provider"] }
+ring = "0.17"
 sha2 = "0.11"
 rustls = { version = "0.23.33", default-features = false, features = ["ring", "std"] }
+serde_json = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [[bin]]
 name = "kt-sfu"

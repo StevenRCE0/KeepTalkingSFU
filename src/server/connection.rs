@@ -24,8 +24,12 @@ use super::{
     limits::rate_limiter::Bucket,
     rooms::{session::Session, session_writer::session_writer},
     voice::datagrams::datagram_loop,
+    wake::serve_wake,
 };
-use crate::proto::{FrameLengthError, Lane, close, priority};
+use crate::{
+    proto::{FrameLengthError, Lane, close, priority},
+    wake::WAKE_ALPN,
+};
 
 /// Counts a connection against `max_connections` until dropped.
 struct ConnectionSlot(Arc<Shared>);
@@ -62,7 +66,10 @@ pub(super) async fn accept_loop(endpoint: Endpoint, shared: Arc<Shared>) {
                 Ok(Err(err)) => return debug!("handshake failed: {err:?}"),
                 Err(_) => return debug!("handshake timed out"),
             };
-            serve_connection(conn, &shared).await;
+            match (conn.alpn() == WAKE_ALPN, shared.wake.clone()) {
+                (true, Some(wake)) => serve_wake(conn, wake, &shared).await,
+                _ => serve_connection(conn, &shared).await,
+            }
             drop(slot);
         });
     }

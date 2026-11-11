@@ -31,9 +31,13 @@ This replaced the Swift SFU on `main` (2026-10-02). The Swift SFU's history is k
 | `src/info.rs` | The one-route HTTP listener behind `/kt/sfu`, and `fetch_info`, its client. |
 | `src/client.rs` | Reference SFU client plus client endpoint setup. The Swift SDK mirrors it on `iroh-ffi`. |
 | `src/tls.rs` | PEM loading (reloaded for cert-manager) and self-signed dev certs. |
+| `src/wake/mod.rs` | Push wakes (ALPN `keeptalking/wake/1`): MINT/SEND/MINTED/RESULT frames and the APNs body. The protocol reference is in the module docs. |
+| `src/wake/handle.rs` | Wake handles: a device's APNs address sealed with AES-256-GCM under `--wake-secret`. |
+| `src/wake/apns.rs` | The APNs provider: ES256 provider token from the `.p8` key, HTTP/2 POST, one retry on `ExpiredProviderToken`. |
+| `src/server/wake.rs` | A wake connection: one request stream, answered in order, rate limited. |
 | `src/bin/kt-sfu.rs` | The service. |
 | `src/bin/kt-probe.rs` | Probe: subscribes to a topic and measures both mesh and SFU delivery to every other probe in it. |
-| `tests/sfu.rs`, `tests/protocol.rs`, `tests/lanes.rs`, `tests/hardening.rs` | End-to-end tests against an in-process server (`tests/common` is the harness). |
+| `tests/sfu.rs`, `tests/protocol.rs`, `tests/lanes.rs`, `tests/hardening.rs`, `tests/wake.rs` | End-to-end tests against an in-process server (`tests/common` is the harness). |
 
 ## Design rules
 
@@ -111,6 +115,10 @@ What the Swift SDK has to do, in order:
 3. Accept every uni stream the SFU opens, read its first byte to learn the lane, then read DELIVERs until FIN. Control and interactive streams stay open; a bulk stream carries one DELIVER. Skip streams with an unknown first byte and frames other than DELIVER.
 4. Publish only after the topic's SNAPSHOT arrived. For control and interactive, open one uni stream per lane on first use, write the lane byte, set its priority (2, 1), and keep writing frames to it. For bulk, open a new uni stream per publish, priority 0, write `0x03`, one frame, and finish. The SFU allows 16 concurrent uni streams per client, so a 15th bulk upload waits for stream credit.
 5. PUBLISH_TO is PUBLISH with the recipient's 32-byte endpoint id between the topic and the payload, tag 0x25. The recipient is a member's id as learnt from its sealed presence.
+
+## Push wakes
+
+With an APNs key configured the SFU endpoint also offers `keeptalking/wake/1`. A device mints **handles** for its APNs token (one per purpose: context message, action authorisation); a peer holding one asks the SFU to push to that device. The handle is the whole capability: it is sealed with a key only the SFU holds and says nothing about contexts or rooms, so the SFU never learns what a wake is for. Each push carries the handle's id as `kt_wake_handle`, which the device maps back to what it minted the handle for. Alerts collapse by handle; revocations go out as background pushes. Apple's refusals come back as they are (410: drop the handle), bodies over 4 KB are refused before Apple sees them, and wakes are rate limited per connection. Without a key the ALPN is not offered.
 
 ## Limits
 
@@ -197,6 +205,11 @@ cargo test
 - **Malformed frames** are skipped and counted, the connection carries on; a bad length prefix closes it.
 - **Empty rooms are removed**; **datagrams from non-subscribers** are not forwarded.
 
+`tests/wake.rs`:
+- **Mint and send** against a fake HTTP/2 APNs: the device URL, `apns-topic`, push type, priority, collapse id, ES256 provider token, and the body's payload and handle id; revocations go out as background pushes.
+- **Refusals:** a forged handle, the wrong kind for a handle, a payload that isn't a JSON object and a body over 4 KB never reach Apple; Apple's own refusal is relayed, and an expired provider token is renewed once.
+- **Rate limit** per connection, and **no wake ALPN** without an APNs key.
+
 `tests/hardening.rs`:
 - **Slow consumer** dropped by the byte budget (interactive lane), **stalled consumer** dropped by the stall timeout (control lane); the publisher and a healthy reader get every frame.
 - **Rate limits** on publish frames (broadcast and directed, across lanes), publish/announce bytes, room joins and datagrams.
@@ -216,6 +229,7 @@ cargo test
 - **TLS:** `--tls-cert` / `--tls-key` take cert-manager's PEM files directly, with no PKCS#12 step, and are re-read periodically.
 - **Public addresses:** set `--public-relay-url https://signal.rcex.live`, plus `--public-quic-port` if the load balancer remaps it.
 - **SFU flags:** `--sfu-bind` (UDP, default `[::]:9702`), `--sfu-key`, `--info-bind`, `--max-connections`, `--relay-client-rate`, `--relay-client-burst` (env `KT_SFU_BIND`, `KT_SFU_KEY`, `KT_SFU_INFO_BIND`, `KT_SFU_MAX_CONNECTIONS`, `KT_SFU_RELAY_CLIENT_RATE`, `KT_SFU_RELAY_CLIENT_BURST`).
+- **Push wakes:** `--apns-key` (the `AuthKey_<KEYID>.p8` PEM), `--apns-key-id`, `--apns-team-id` and `--wake-secret` (env `KT_SFU_APNS_KEY`, `KT_SFU_APNS_KEY_ID`, `KT_SFU_APNS_TEAM_ID`, `KT_SFU_WAKE_SECRET`) turn on `keeptalking/wake/1`; all four or none. `--wake-secret` names a file created on first start; persist it next to the SFU key, since losing it orphans every handle devices hold. The handle picks sandbox or production APNs, so one key serves both.
 - **SFU key:** persist `--sfu-key`. Clients look the SFU id up at `/kt/sfu`, but a changing id still drops every SFU session on restart.
 - **CI:** `.github/workflows/docker.yml` runs `cargo test`, then builds `ghcr.io/stevenrce0/keeptalkingsfu` for amd64 and arm64. Pushes to `main` tag `latest`, `main` and `sha-<short>`; `v*.*.*` tags add semver tags.
 

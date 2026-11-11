@@ -14,6 +14,7 @@ use keeptalking_sfu::{
     proto::{ClientFrame, Lane, Member, SFU_ALPN, ServerFrame, Topic, read_frame},
     server::{Limits, Rate, RelayRateLimit, Sfu, SfuConfig},
     tls::DevCert,
+    wake::WakeConfig,
 };
 
 pub const TEST_ALPN: &[u8] = b"keeptalking/test/1";
@@ -38,6 +39,14 @@ impl Harness {
     }
 
     pub async fn with_limits(limits: Limits) -> Self {
+        Self::spawn(limits, None).await
+    }
+
+    pub async fn with_wake(limits: Limits, wake: WakeConfig) -> Self {
+        Self::spawn(limits, Some(wake)).await
+    }
+
+    async fn spawn(limits: Limits, wake: Option<WakeConfig>) -> Self {
         let dev = DevCert::generate(&[]).unwrap();
         let local = |port| (Ipv4Addr::LOCALHOST, port).into();
         let sfu = Sfu::spawn(SfuConfig {
@@ -52,6 +61,7 @@ impl Harness {
             sfu_secret: SecretKey::generate(),
             sfu_ca: Some(dev.ca()),
             limits,
+            wake,
         })
         .await
         .unwrap();
