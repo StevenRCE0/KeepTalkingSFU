@@ -302,13 +302,47 @@ async fn wakes_are_rate_limited_per_connection() {
     assert_eq!(apns.take().len(), 1);
 }
 
-/// Without an APNs key the SFU does not offer the wake ALPN at all.
+/// A provider that isn't configured answers 501 naming it, the same whether
+/// the SFU has no providers at all or only lacks this one, so a client meets
+/// one error either way.
 #[tokio::test]
-async fn wakes_are_not_offered_without_apns() {
-    let h = Harness::start().await;
-    let endpoint = h.endpoint(false).await;
-    let connected = tokio::time::timeout(WAIT, endpoint.connect(h.direct_addr(), WAKE_ALPN))
-        .await
-        .expect("connect timed out");
-    assert!(connected.is_err());
+async fn an_unconfigured_provider_answers_501_naming_it() {
+    for wake in [
+        None,
+        Some(WakeConfig {
+            handle_secret: vec![42; 32],
+            apns: None,
+        }),
+    ] {
+        let h = match wake {
+            Some(wake) => Harness::with_wake(Limits::default(), wake).await,
+            None => Harness::start().await,
+        };
+        let mut client = WakeClient::connect(&h).await;
+        let minted = client
+            .ask(WakeRequest::Mint {
+                purposes: vec![Purpose::ContextMessage],
+                address: Address::Apns(ApnsAddress {
+                    environment: Environment::Development,
+                    topic: BUNDLE.into(),
+                    token: TOKEN.to_vec(),
+                }),
+            })
+            .await;
+        assert_eq!(minted, WakeResponse::status(status::UNSUPPORTED, "apns"));
+        let sent = client
+            .ask(WakeRequest::Send {
+                kind: Kind::Context,
+                handle: Bytes::from_static(&[1; 64]),
+                payload: Bytes::from_static(b"{}"),
+            })
+            .await;
+        let WakeResponse::Result(outcome) = sent else {
+            panic!("expected RESULT, got {sent:?}");
+        };
+        assert!(
+            [status::UNSUPPORTED, status::BAD_REQUEST].contains(&outcome.status),
+            "{outcome:?}"
+        );
+    }
 }

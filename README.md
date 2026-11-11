@@ -118,9 +118,9 @@ What the Swift SDK has to do, in order:
 
 ## Push wakes
 
-With at least one push provider configured the SFU endpoint also offers `keeptalking/wake/1`. A device mints **handles** for its push address (one per purpose: context message, action authorisation); a peer holding one asks the SFU to push to that device. The handle is the whole capability: it is sealed with a key only the SFU holds and says nothing about contexts or rooms, so the SFU never learns what a wake is for. Each push carries the handle's id as `kt_wake_handle`, which the device maps back to what it minted the handle for. Wakes are rate limited per connection, and a provider's refusal comes back as it is.
+The SFU endpoint also offers `keeptalking/wake/1`. A device mints **handles** for its push address (one per purpose: context message, action authorisation); a peer holding one asks the SFU to push to that device. The handle is the whole capability: it is sealed with a key only the SFU holds and says nothing about contexts or rooms, so the SFU never learns what a wake is for. Each push carries the handle's id as `kt_wake_handle`, which the device maps back to what it minted the handle for. Wakes are rate limited per connection, and a provider's refusal comes back as it is.
 
-An address names its provider, and each provider is optional; asking for one that isn't configured gets 501. Providers today:
+An address names its provider, and each provider is optional: one that isn't configured answers 501 with its name as the reason, and an SFU with no providers at all answers every request that way, so clients meet one error for both. Providers today:
 
 - **Apple (APNs).** Alerts collapse by handle and revocations go out as background pushes; bodies over 4 KB are refused before Apple sees them, and a 410 means drop the handle.
 
@@ -212,7 +212,7 @@ cargo test
 `tests/wake.rs`:
 - **Mint and send** against a fake HTTP/2 APNs: the device URL, `apns-topic`, push type, priority, collapse id, ES256 provider token, and the body's payload and handle id; revocations go out as background pushes.
 - **Refusals:** a forged handle, the wrong kind for a handle, a payload that isn't a JSON object and a body over 4 KB never reach Apple; Apple's own refusal is relayed, and an expired provider token is renewed once.
-- **Rate limit** per connection, and **no wake ALPN** without a push provider.
+- **Rate limit** per connection, and **501 naming the provider** when it isn't configured, whether no provider is or just not that one.
 
 `tests/hardening.rs`:
 - **Slow consumer** dropped by the byte budget (interactive lane), **stalled consumer** dropped by the stall timeout (control lane); the publisher and a healthy reader get every frame.

@@ -40,6 +40,13 @@ pub enum Address {
 impl Address {
     const APNS: u8 = 1;
 
+    /// The provider's name, as a 501 reports it.
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            Self::Apns(_) => "apns",
+        }
+    }
+
     /// Whether `encode` can carry it.
     pub fn is_encodable(&self) -> bool {
         match self {

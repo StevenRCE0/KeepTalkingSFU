@@ -117,7 +117,8 @@ pub struct SfuConfig {
     /// Trust anchors the SFU uses to reach its own relay. `None` = web PKI.
     pub sfu_ca: Option<CaTlsConfig>,
     pub limits: Limits,
-    /// Push wakes over APNs on [`WAKE_ALPN`]. `None` = not offered.
+    /// Push wake providers on [`WAKE_ALPN`]. `None` = none: the ALPN is
+    /// still offered and answers 501.
     pub wake: Option<WakeConfig>,
 }
 
@@ -135,7 +136,7 @@ struct Shared {
     rooms: Rooms,
     stats: Arc<Stats>,
     limits: Limits,
-    wake: Option<Arc<Wake>>,
+    wake: Arc<Wake>,
 }
 
 impl Sfu {
@@ -177,11 +178,8 @@ impl Sfu {
             .send_window((limits.bulk_outbox_bytes + QUIC_SEND_WINDOW_HEADROOM) as u64)
             .datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER))
             .build();
-        let wake = config.wake.map(Wake::new).transpose()?.map(Arc::new);
-        let mut alpns = vec![SFU_ALPN.to_vec()];
-        if wake.is_some() {
-            alpns.push(WAKE_ALPN.to_vec());
-        }
+        let wake = Arc::new(Wake::new(config.wake)?);
+        let alpns = vec![SFU_ALPN.to_vec(), WAKE_ALPN.to_vec()];
         let mut endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(config.sfu_secret)
             .alpns(alpns)

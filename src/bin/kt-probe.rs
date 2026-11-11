@@ -158,7 +158,7 @@ async fn wake(args: WakeArgs) -> Result<()> {
     let conn = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, WAKE_ALPN))
         .await
         .context("connecting timed out")?
-        .context("the SFU refused keeptalking/wake/1 (no push provider configured?)")?;
+        .context("the SFU refused keeptalking/wake/1 (a build from before push wakes?)")?;
     println!("wake     connected");
     let (mut send, mut recv) = conn.open_bi().await?;
     let mut ask = async |request: WakeRequest| -> Result<WakeResponse> {

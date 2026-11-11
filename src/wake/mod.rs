@@ -8,12 +8,14 @@
 //! `id` (as `kt_wake_handle`), which the device maps back to what it minted
 //! the handle for.
 //!
-//! An address names its push provider; each provider is optional, and the
-//! service offers the ALPN when at least one is configured. Providers:
+//! An address names its push provider; each provider is optional. The ALPN
+//! is always offered: a provider that isn't configured, or none at all,
+//! answers 501 with the provider's name as the reason (empty when a SEND's
+//! handle can't say, because no provider ever was). Providers:
 //!
 //! | byte | provider | address                                                 |
 //! |------|----------|---------------------------------------------------------|
-//! | 0x01 | APNs     | environment(u8) ‖ u8 len ‖ topic (bundle id) ‖ u8 len ‖ token |
+//! | 0x01 | `apns`   | environment(u8) ‖ u8 len ‖ topic (bundle id) ‖ u8 len ‖ token |
 //!
 //! (APNs environment 0 = development/sandbox, 1 = production.)
 //!
@@ -39,7 +41,7 @@
 //!   token is gone, drop the handle), or 400 (malformed, a handle this
 //!   service did not seal, or the wrong kind for it), 413 (over the
 //!   provider's size limit), 429 (rate limited), 501 (provider not
-//!   configured here) or 502 (provider unreachable). A MINT is answered with
+//!   configured here, named in the reason) or 502 (provider unreachable). A MINT is answered with
 //!   MINTED, or RESULT 400 / 429 / 501.
 
 pub mod apns;
@@ -287,16 +289,24 @@ pub struct WakeConfig {
     pub apns: Option<ApnsConfig>,
 }
 
+/// The wake service. It is always offered: without providers it answers
+/// every request 501, so a client meets one error for "nothing configured"
+/// and "not this provider".
 pub struct Wake {
-    sealer: HandleSealer,
+    sealer: Option<HandleSealer>,
     apns: Option<Apns>,
 }
 
 impl Wake {
-    pub fn new(config: WakeConfig) -> Result<Self> {
-        ensure!(config.apns.is_some(), "no push provider configured");
+    pub fn new(config: Option<WakeConfig>) -> Result<Self> {
+        let Some(config) = config else {
+            return Ok(Self {
+                sealer: None,
+                apns: None,
+            });
+        };
         Ok(Self {
-            sealer: HandleSealer::new(&config.handle_secret)?,
+            sealer: Some(HandleSealer::new(&config.handle_secret)?),
             apns: config.apns.map(Apns::new).transpose()?,
         })
     }
@@ -320,14 +330,14 @@ impl Wake {
     }
 
     fn mint(&self, purposes: Vec<Purpose>, address: Address) -> WakeResponse {
-        if !self.offers(&address) {
-            return WakeResponse::status(status::UNSUPPORTED, "push provider not configured");
-        }
+        let Some(sealer) = self.sealer.as_ref().filter(|_| self.offers(&address)) else {
+            return WakeResponse::status(status::UNSUPPORTED, address.provider_name());
+        };
         let minted = purposes
             .into_iter()
             .map(|purpose| {
                 let id = Uuid::new_v4();
-                let handle = self.sealer.seal(&Handle {
+                let handle = sealer.seal(&Handle {
                     id: *id.as_bytes(),
                     purpose,
                     address: address.clone(),
@@ -342,7 +352,10 @@ impl Wake {
     }
 
     async fn send(&self, kind: Kind, sealed: &[u8], payload: &[u8]) -> Outcome {
-        let handle = match self.sealer.open(sealed) {
+        let Some(sealer) = &self.sealer else {
+            return Outcome::new(status::UNSUPPORTED, "");
+        };
+        let handle = match sealer.open(sealed) {
             Ok(handle) if handle.purpose == kind.purpose() => handle,
             Ok(_) => return Outcome::new(status::BAD_REQUEST, "wrong kind for this handle"),
             Err(err) => return Outcome::new(status::BAD_REQUEST, format!("{err:#}")),
@@ -351,7 +364,7 @@ impl Wake {
         let outcome = match (&handle.address, &self.apns) {
             (Address::Apns(address), Some(apns)) => apns.send(address, kind, &id, payload).await,
             (Address::Apns(_), None) => {
-                Outcome::new(status::UNSUPPORTED, "push provider not configured")
+                Outcome::new(status::UNSUPPORTED, handle.address.provider_name())
             }
         };
         if outcome.status != status::OK {

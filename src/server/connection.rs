@@ -66,9 +66,10 @@ pub(super) async fn accept_loop(endpoint: Endpoint, shared: Arc<Shared>) {
                 Ok(Err(err)) => return debug!("handshake failed: {err:?}"),
                 Err(_) => return debug!("handshake timed out"),
             };
-            match (conn.alpn() == WAKE_ALPN, shared.wake.clone()) {
-                (true, Some(wake)) => serve_wake(conn, wake, &shared).await,
-                _ => serve_connection(conn, &shared).await,
+            if conn.alpn() == WAKE_ALPN {
+                serve_wake(conn, shared.wake.clone(), &shared).await;
+            } else {
+                serve_connection(conn, &shared).await;
             }
             drop(slot);
         });
