@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, BufMut, BytesMut};
 use clap::Parser;
 use iroh::{
@@ -33,7 +33,13 @@ use keeptalking_sfu::{
     client::{ClientOptions, Delivery, SfuClient, bind_client},
     info,
     proto::{Lane, ServerFrame, Topic},
+    proto::read_frame_up_to,
     tls::ca_from_pem_file,
+    wake::{
+        Kind, MAX_WAKE_FRAME_LEN, WAKE_ALPN, WakeRequest, WakeResponse,
+        apns::{ApnsAddress, Environment},
+        handle::{Address, Purpose},
+    },
 };
 use n0_future::StreamExt;
 use sha2::{Digest, Sha256};
@@ -55,6 +61,29 @@ const BULK_PROBE_LEN: usize = 256 * 1024;
 enum Command {
     /// Subscribe to a topic and connect to every other probe in it.
     Room(RoomArgs),
+    /// Mint a wake handle and send one wake through it. With a made-up
+    /// token, APNs answering 400 BadDeviceToken proves the SFU's key, key
+    /// id and team id are right.
+    Wake(WakeArgs),
+}
+
+#[derive(Parser, Debug)]
+struct WakeArgs {
+    /// The info endpoint, e.g. https://signal.rcex.live/kt/sfu.
+    #[arg(long)]
+    info: Url,
+    /// PEM root to trust for the relay and the info URL.
+    #[arg(long)]
+    relay_ca: Option<PathBuf>,
+    /// The app's bundle id, sent as `apns-topic`.
+    #[arg(long, default_value = "org.rcex.KeepTalkingApp")]
+    bundle: String,
+    /// A device token (hex). Defaults to a made-up one.
+    #[arg(long)]
+    token: Option<String>,
+    /// Use production APNs instead of the sandbox.
+    #[arg(long)]
+    production: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -106,7 +135,94 @@ async fn main() -> Result<()> {
         .init();
     match Command::parse() {
         Command::Room(args) => room(args).await,
+        Command::Wake(args) => wake(args).await,
     }
+}
+
+async fn wake(args: WakeArgs) -> Result<()> {
+    let ca = args.relay_ca.as_deref().map(ca_from_pem_file).transpose()?;
+    let info = info::fetch_info(&args.info, ca.as_ref()).await?;
+    println!("info     sfu {} relay {}", info.sfu.fmt_short(), info.relay);
+    let relay_map: iroh::RelayMap =
+        iroh::RelayConfig::new(info.relay.clone(), info.qad_port.map(RelayQuicConfig::new)).into();
+    let endpoint = bind_client(ClientOptions {
+        relay_map,
+        ca,
+        alpns: vec![PROBE_ALPN.to_vec()],
+        secret_key: None,
+        relay_only: false,
+        transport: None,
+    })
+    .await?;
+    let addr = EndpointAddr::new(info.sfu).with_relay_url(info.relay);
+    let conn = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, WAKE_ALPN))
+        .await
+        .context("connecting timed out")?
+        .context("the SFU refused keeptalking/wake/1 (no push provider configured?)")?;
+    println!("wake     connected");
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let mut ask = async |request: WakeRequest| -> Result<WakeResponse> {
+        send.write_all(&request.encode()?).await?;
+        let (tag, body) = read_frame_up_to(&mut recv, MAX_WAKE_FRAME_LEN)
+            .await?
+            .context("the SFU closed the wake stream")?;
+        WakeResponse::decode(tag, body)
+    };
+
+    let token = match &args.token {
+        Some(hex) => (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(hex.get(at..at + 2).unwrap_or("x"), 16))
+            .collect::<Result<Vec<_>, _>>()
+            .context("--token is not hex")?,
+        None => vec![0x6b; 32],
+    };
+    let environment = if args.production {
+        Environment::Production
+    } else {
+        Environment::Development
+    };
+    let minted = match ask(WakeRequest::Mint {
+        purposes: vec![Purpose::ContextMessage],
+        address: Address::Apns(ApnsAddress {
+            environment,
+            topic: args.bundle.clone(),
+            token,
+        }),
+    })
+    .await?
+    {
+        WakeResponse::Minted(mut handles) if handles.len() == 1 => handles.remove(0),
+        other => bail!("mint failed: {other:?}"),
+    };
+    println!("mint     handle {} ({} bytes)", minted.id, minted.handle.len());
+
+    let outcome = match ask(WakeRequest::Send {
+        kind: Kind::Context,
+        handle: minted.handle,
+        payload: br#"{"ciphertext":"kt-probe"}"#.as_slice().into(),
+    })
+    .await?
+    {
+        WakeResponse::Result(outcome) => outcome,
+        other => bail!("expected RESULT, got {other:?}"),
+    };
+    println!("send     {} {}", outcome.status, outcome.reason);
+    let verdict = match (outcome.status, outcome.reason.as_str()) {
+        (200, _) => "delivered: APNs accepted the push",
+        (400, "BadDeviceToken") if args.token.is_none() => {
+            "APNs authenticated the SFU and refused only the made-up token: the key, key id and team id are right"
+        }
+        (403, "InvalidProviderToken") => "APNs refused the provider token: check the key id, team id and .p8",
+        (403, _) => "APNs refused the SFU's credentials",
+        (501, _) => "the SFU has no Apple provider configured",
+        (502, _) => "the SFU could not reach APNs",
+        _ => "see the status and reason above",
+    };
+    println!("verdict  {verdict}");
+    conn.close(0u32.into(), b"done");
+    endpoint.close().await;
+    Ok(())
 }
 
 async fn room(args: RoomArgs) -> Result<()> {
