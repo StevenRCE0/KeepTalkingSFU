@@ -1,4 +1,4 @@
-//! Wake handles: a device's APNs address, sealed so only this service can
+//! Wake handles: a device's push address, sealed so only this service can
 //! read it. Holding a handle is the only way to wake that device.
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -8,6 +8,8 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use sha2::{Digest, Sha256};
+
+use super::apns::ApnsAddress;
 
 pub const MIN_SECRET_LEN: usize = 32;
 const VERSION: u8 = 1;
@@ -29,18 +31,37 @@ impl Purpose {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Environment {
-    Development = 0,
-    Production = 1,
+/// The push service that reaches a device, and its address there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Address {
+    Apns(ApnsAddress),
 }
 
-impl Environment {
-    pub fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0 => Some(Self::Development),
-            1 => Some(Self::Production),
-            _ => None,
+impl Address {
+    const APNS: u8 = 1;
+
+    /// Whether `encode` can carry it.
+    pub fn is_encodable(&self) -> bool {
+        match self {
+            Self::Apns(address) => address.is_encodable(),
+        }
+    }
+
+    pub fn encode(&self, out: &mut BytesMut) {
+        match self {
+            Self::Apns(address) => {
+                out.put_u8(Self::APNS);
+                address.encode(out);
+            }
+        }
+    }
+
+    /// Reads the rest of `body` as one address.
+    pub fn decode(body: &mut Bytes) -> Result<Self> {
+        ensure!(body.remaining() >= 1, "truncated address");
+        match body.get_u8() {
+            Self::APNS => Ok(Self::Apns(ApnsAddress::decode(body)?)),
+            other => Err(anyhow!("unknown push provider {other}")),
         }
     }
 }
@@ -52,43 +73,30 @@ impl Environment {
 pub struct Handle {
     pub id: [u8; 16],
     pub purpose: Purpose,
-    pub environment: Environment,
-    /// The app's bundle id, sent as `apns-topic`.
-    pub apns_topic: String,
-    pub token: Vec<u8>,
+    pub address: Address,
 }
 
 impl Handle {
     fn encode(&self) -> BytesMut {
-        let mut out = BytesMut::with_capacity(21 + self.apns_topic.len() + self.token.len());
+        let mut out = BytesMut::new();
         out.put_u8(VERSION);
         out.put_slice(&self.id);
         out.put_u8(self.purpose as u8);
-        out.put_u8(self.environment as u8);
-        out.put_u8(self.apns_topic.len() as u8);
-        out.put_slice(self.apns_topic.as_bytes());
-        out.put_u8(self.token.len() as u8);
-        out.put_slice(&self.token);
+        self.address.encode(&mut out);
         out
     }
 
     fn decode(mut body: Bytes) -> Result<Self> {
-        ensure!(body.remaining() >= 20, "truncated handle");
+        ensure!(body.remaining() >= 18, "truncated handle");
         ensure!(body.get_u8() == VERSION, "unknown handle version");
         let id: [u8; 16] = body.split_to(16)[..].try_into().expect("16 bytes");
         let purpose = Purpose::from_byte(body.get_u8()).context("unknown purpose")?;
-        let environment = Environment::from_byte(body.get_u8()).context("unknown environment")?;
-        let topic_len = body.get_u8() as usize;
-        ensure!(body.remaining() > topic_len, "truncated handle");
-        let apns_topic = String::from_utf8(body.split_to(topic_len).to_vec())?;
-        let token_len = body.get_u8() as usize;
-        ensure!(body.remaining() == token_len, "truncated handle");
+        let address = Address::decode(&mut body)?;
+        ensure!(body.is_empty(), "trailing bytes in handle");
         Ok(Self {
             id,
             purpose,
-            environment,
-            apns_topic,
-            token: body.to_vec(),
+            address,
         })
     }
 }
@@ -146,14 +154,17 @@ impl HandleSealer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wake::apns::Environment;
 
     fn handle() -> Handle {
         Handle {
             id: [7; 16],
             purpose: Purpose::ContextMessage,
-            environment: Environment::Production,
-            apns_topic: "dev.keeptalking.app".into(),
-            token: vec![0xAB; 32],
+            address: Address::Apns(ApnsAddress {
+                environment: Environment::Production,
+                topic: "dev.keeptalking.app".into(),
+                token: vec![0xAB; 32],
+            }),
         }
     }
 
@@ -179,5 +190,11 @@ mod tests {
     #[test]
     fn short_secrets_are_refused() {
         assert!(HandleSealer::new(&[1; 31]).is_err());
+    }
+
+    #[test]
+    fn an_unknown_provider_is_refused() {
+        let mut body = Bytes::from_static(&[9, 0, 0]);
+        assert!(Address::decode(&mut body).is_err());
     }
 }

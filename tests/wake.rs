@@ -22,8 +22,8 @@ use keeptalking_sfu::{
     wake::{
         HANDLE_ID_KEY, Kind, MAX_WAKE_FRAME_LEN, MintedHandle, WAKE_ALPN, WakeConfig, WakeRequest,
         WakeResponse,
-        apns::ApnsConfig,
-        handle::{Environment, Purpose},
+        apns::{ApnsAddress, ApnsConfig, Environment},
+        handle::{Address, Purpose},
         status,
     },
 };
@@ -107,7 +107,7 @@ fn wake_config(url: &str) -> WakeConfig {
     apns.development_url = url.parse().unwrap();
     WakeConfig {
         handle_secret: vec![42; 32],
-        apns,
+        apns: Some(apns),
     }
 }
 
@@ -147,10 +147,12 @@ impl WakeClient {
     async fn mint(&mut self, purposes: Vec<Purpose>) -> Vec<MintedHandle> {
         match self
             .ask(WakeRequest::Mint {
-                environment: Environment::Development,
-                apns_topic: BUNDLE.into(),
-                token: TOKEN.to_vec(),
                 purposes,
+                address: Address::Apns(ApnsAddress {
+                    environment: Environment::Development,
+                    topic: BUNDLE.into(),
+                    token: TOKEN.to_vec(),
+                }),
             })
             .await
         {
@@ -168,7 +170,7 @@ impl WakeClient {
             })
             .await
         {
-            WakeResponse::Result { status, reason } => (status, reason),
+            WakeResponse::Result(outcome) => (outcome.status, outcome.reason),
             other => panic!("expected RESULT, got {other:?}"),
         }
     }

@@ -101,25 +101,26 @@ struct Args {
     #[arg(long, env = "KT_SFU_MAX_CONNECTIONS", default_value_t = 10_000)]
     max_connections: usize,
 
-    /// APNs token key (`AuthKey_<KEYID>.p8`). With --apns-key-id and
-    /// --apns-team-id it turns on push wakes (`keeptalking/wake/1`).
+    /// Apple push provider: the APNs token key (`AuthKey_<KEYID>.p8`). With
+    /// --apple-apns-key-id and --apple-apns-team-id it turns on push wakes
+    /// (`keeptalking/wake/1`) to Apple devices.
     #[arg(
         long,
-        env = "KT_SFU_APNS_KEY",
-        requires_all = ["apns_key_id", "apns_team_id", "wake_secret"]
+        env = "KT_SFU_APPLE_APNS_KEY",
+        requires_all = ["apple_apns_key_id", "apple_apns_team_id", "wake_secret"]
     )]
-    apns_key: Option<PathBuf>,
+    apple_apns_key: Option<PathBuf>,
 
-    #[arg(long, env = "KT_SFU_APNS_KEY_ID", requires = "apns_key")]
-    apns_key_id: Option<String>,
+    #[arg(long, env = "KT_SFU_APPLE_APNS_KEY_ID", requires = "apple_apns_key")]
+    apple_apns_key_id: Option<String>,
 
-    #[arg(long, env = "KT_SFU_APNS_TEAM_ID", requires = "apns_key")]
-    apns_team_id: Option<String>,
+    #[arg(long, env = "KT_SFU_APPLE_APNS_TEAM_ID", requires = "apple_apns_key")]
+    apple_apns_team_id: Option<String>,
 
     /// File holding the secret wake handles are sealed with; created if
-    /// missing. Keep it with --sfu-key: losing it orphans every handle
-    /// devices have handed out.
-    #[arg(long, env = "KT_SFU_WAKE_SECRET", requires = "apns_key")]
+    /// missing. Needed with any push provider. Keep it with --sfu-key:
+    /// losing it orphans every handle devices have handed out.
+    #[arg(long, env = "KT_SFU_WAKE_SECRET", requires = "apple_apns_key")]
     wake_secret: Option<PathBuf>,
 }
 
@@ -134,24 +135,27 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let sfu_secret = load_or_create_key(&args.sfu_key).await?;
-    let wake = match (
-        &args.apns_key,
-        &args.apns_key_id,
-        &args.apns_team_id,
-        &args.wake_secret,
+    let apns = match (
+        &args.apple_apns_key,
+        &args.apple_apns_key_id,
+        &args.apple_apns_team_id,
     ) {
-        (Some(key), Some(key_id), Some(team_id), Some(wake_secret)) => {
+        (Some(key), Some(key_id), Some(team_id)) => {
             let key = PrivatePkcs8KeyDer::from_pem_file(key)
                 .with_context(|| format!("reading the APNs key {}", key.display()))?;
-            Some(WakeConfig {
-                handle_secret: load_or_create_secret(wake_secret).await?,
-                apns: ApnsConfig::new(
-                    key_id.clone(),
-                    team_id.clone(),
-                    key.secret_pkcs8_der().to_vec(),
-                ),
-            })
+            Some(ApnsConfig::new(
+                key_id.clone(),
+                team_id.clone(),
+                key.secret_pkcs8_der().to_vec(),
+            ))
         }
+        _ => None,
+    };
+    let wake = match (&args.wake_secret, apns.is_some()) {
+        (Some(wake_secret), true) => Some(WakeConfig {
+            handle_secret: load_or_create_secret(wake_secret).await?,
+            apns,
+        }),
         _ => None,
     };
     let (cert, sfu_ca) = if args.dev {
