@@ -23,7 +23,7 @@ use keeptalking_sfu::{
         HANDLE_ID_KEY, Kind, MAX_WAKE_FRAME_LEN, MintedHandle, WAKE_ALPN, WakeConfig, WakeRequest,
         WakeResponse,
         apns::{ApnsAddress, ApnsConfig, Environment},
-        handle::{Address, Purpose},
+        handle::{Address, Provider, Purpose},
         status,
     },
 };
@@ -165,6 +165,7 @@ impl WakeClient {
         match self
             .ask(WakeRequest::Send {
                 kind,
+                provider: Provider::Apns,
                 handle: handle.handle.clone(),
                 payload: Bytes::copy_from_slice(payload.as_bytes()),
             })
@@ -333,16 +334,11 @@ async fn an_unconfigured_provider_answers_501_naming_it() {
         let sent = client
             .ask(WakeRequest::Send {
                 kind: Kind::Context,
+                provider: Provider::Apns,
                 handle: Bytes::from_static(&[1; 64]),
                 payload: Bytes::from_static(b"{}"),
             })
             .await;
-        let WakeResponse::Result(outcome) = sent else {
-            panic!("expected RESULT, got {sent:?}");
-        };
-        assert!(
-            [status::UNSUPPORTED, status::BAD_REQUEST].contains(&outcome.status),
-            "{outcome:?}"
-        );
+        assert_eq!(sent, WakeResponse::status(status::UNSUPPORTED, "apns"));
     }
 }

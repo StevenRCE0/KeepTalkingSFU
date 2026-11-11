@@ -10,8 +10,10 @@
 //!
 //! An address names its push provider; each provider is optional. The ALPN
 //! is always offered: a provider that isn't configured, or none at all,
-//! answers 501 with the provider's name as the reason (empty when a SEND's
-//! handle can't say, because no provider ever was). Providers:
+//! answers 501 with the provider's name as the reason. A SEND names its
+//! provider (devices publish each handle as `<name>:<base64>`), so it is
+//! routed, or refused, before the handle is opened; a handle sealed for
+//! another provider is refused with 400. Providers:
 //!
 //! | byte | provider | address                                                 |
 //! |------|----------|---------------------------------------------------------|
@@ -26,7 +28,7 @@
 //! | dir | tag  | frame  | body                                                                        |
 //! |-----|------|--------|-----------------------------------------------------------------------------|
 //! | C→S | 0x51 | MINT   | u8 n ‖ n × purpose(u8) ‖ provider(u8) ‖ address                             |
-//! | C→S | 0x52 | SEND   | kind(u8) ‖ u16 len ‖ handle ‖ payload (a JSON object)                      |
+//! | C→S | 0x52 | SEND   | kind(u8) ‖ provider(u8) ‖ u16 len ‖ handle ‖ payload (a JSON object)       |
 //! | S→C | 0x61 | MINTED | u8 n ‖ n × (id(16) ‖ u16 len ‖ handle), one per requested purpose, in order |
 //! | S→C | 0x62 | RESULT | u16 status ‖ UTF-8 reason                                                   |
 //!
@@ -53,7 +55,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use apns::{Apns, ApnsConfig};
-use handle::{Address, Handle, HandleSealer, Purpose};
+use handle::{Address, Handle, HandleSealer, Provider, Purpose};
 
 pub const WAKE_ALPN: &[u8] = b"keeptalking/wake/1";
 pub const MAX_WAKE_FRAME_LEN: usize = 8 * 1024;
@@ -134,6 +136,7 @@ pub enum WakeRequest {
     },
     Send {
         kind: Kind,
+        provider: Provider,
         handle: Bytes,
         payload: Bytes,
     },
@@ -186,11 +189,13 @@ impl WakeRequest {
             }
             Self::Send {
                 kind,
+                provider,
                 handle,
                 payload,
             } => {
                 ensure!(handle.len() <= u16::MAX as usize, "handle too long");
                 body.put_u8(*kind as u8);
+                body.put_u8(*provider as u8);
                 body.put_u16(handle.len() as u16);
                 body.put_slice(handle);
                 body.put_slice(payload);
@@ -218,11 +223,13 @@ impl WakeRequest {
                 Ok(Self::Mint { purposes, address })
             }
             tag::SEND => {
-                ensure!(body.remaining() >= 1, "truncated");
+                ensure!(body.remaining() >= 2, "truncated");
                 let kind = Kind::from_byte(body.get_u8()).context("unknown kind")?;
+                let provider = Provider::from_byte(body.get_u8()).context("unknown push provider")?;
                 let handle = take_long(&mut body)?;
                 Ok(Self::Send {
                     kind,
+                    provider,
                     handle,
                     payload: body,
                 })
@@ -316,22 +323,24 @@ impl Wake {
             Ok(WakeRequest::Mint { purposes, address }) => self.mint(purposes, address),
             Ok(WakeRequest::Send {
                 kind,
+                provider,
                 handle,
                 payload,
-            }) => WakeResponse::Result(self.send(kind, &handle, &payload).await),
+            }) => WakeResponse::Result(self.send(kind, provider, &handle, &payload).await),
             Err(err) => WakeResponse::status(status::BAD_REQUEST, format!("{err:#}")),
         }
     }
 
-    fn offers(&self, address: &Address) -> bool {
-        match address {
-            Address::Apns(_) => self.apns.is_some(),
-        }
+    fn offers(&self, provider: Provider) -> bool {
+        self.sealer.is_some()
+            && match provider {
+                Provider::Apns => self.apns.is_some(),
+            }
     }
 
     fn mint(&self, purposes: Vec<Purpose>, address: Address) -> WakeResponse {
-        let Some(sealer) = self.sealer.as_ref().filter(|_| self.offers(&address)) else {
-            return WakeResponse::status(status::UNSUPPORTED, address.provider_name());
+        let Some(sealer) = self.sealer.as_ref().filter(|_| self.offers(address.provider())) else {
+            return WakeResponse::status(status::UNSUPPORTED, address.provider().name());
         };
         let minted = purposes
             .into_iter()
@@ -351,11 +360,14 @@ impl Wake {
         }
     }
 
-    async fn send(&self, kind: Kind, sealed: &[u8], payload: &[u8]) -> Outcome {
-        let Some(sealer) = &self.sealer else {
-            return Outcome::new(status::UNSUPPORTED, "");
+    async fn send(&self, kind: Kind, provider: Provider, sealed: &[u8], payload: &[u8]) -> Outcome {
+        let Some(sealer) = self.sealer.as_ref().filter(|_| self.offers(provider)) else {
+            return Outcome::new(status::UNSUPPORTED, provider.name());
         };
         let handle = match sealer.open(sealed) {
+            Ok(handle) if handle.address.provider() != provider => {
+                return Outcome::new(status::BAD_REQUEST, "handle is for another provider");
+            }
             Ok(handle) if handle.purpose == kind.purpose() => handle,
             Ok(_) => return Outcome::new(status::BAD_REQUEST, "wrong kind for this handle"),
             Err(err) => return Outcome::new(status::BAD_REQUEST, format!("{err:#}")),
@@ -363,9 +375,7 @@ impl Wake {
         let id = Uuid::from_bytes(handle.id).to_string();
         let outcome = match (&handle.address, &self.apns) {
             (Address::Apns(address), Some(apns)) => apns.send(address, kind, &id, payload).await,
-            (Address::Apns(_), None) => {
-                Outcome::new(status::UNSUPPORTED, handle.address.provider_name())
-            }
+            (Address::Apns(_), None) => Outcome::new(status::UNSUPPORTED, provider.name()),
         };
         if outcome.status != status::OK {
             debug!(status = outcome.status, reason = %outcome.reason, "a wake was refused");
@@ -398,6 +408,7 @@ mod tests {
             },
             WakeRequest::Send {
                 kind: Kind::Revocation,
+                provider: Provider::Apns,
                 handle: Bytes::from_static(&[9; 80]),
                 payload: Bytes::from_static(br#"{"ciphertext":"x"}"#),
             },

@@ -31,6 +31,28 @@ impl Purpose {
     }
 }
 
+/// A push service. Its byte tags addresses and SENDs; its name is what
+/// devices prefix published handles with and what a 501 reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Apns = 1,
+}
+
+impl Provider {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Apns),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Apns => "apns",
+        }
+    }
+}
+
 /// The push service that reaches a device, and its address there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Address {
@@ -38,12 +60,9 @@ pub enum Address {
 }
 
 impl Address {
-    const APNS: u8 = 1;
-
-    /// The provider's name, as a 501 reports it.
-    pub fn provider_name(&self) -> &'static str {
+    pub fn provider(&self) -> Provider {
         match self {
-            Self::Apns(_) => "apns",
+            Self::Apns(_) => Provider::Apns,
         }
     }
 
@@ -55,20 +74,19 @@ impl Address {
     }
 
     pub fn encode(&self, out: &mut BytesMut) {
+        out.put_u8(self.provider() as u8);
         match self {
-            Self::Apns(address) => {
-                out.put_u8(Self::APNS);
-                address.encode(out);
-            }
+            Self::Apns(address) => address.encode(out),
         }
     }
 
     /// Reads the rest of `body` as one address.
     pub fn decode(body: &mut Bytes) -> Result<Self> {
         ensure!(body.remaining() >= 1, "truncated address");
-        match body.get_u8() {
-            Self::APNS => Ok(Self::Apns(ApnsAddress::decode(body)?)),
-            other => Err(anyhow!("unknown push provider {other}")),
+        let byte = body.get_u8();
+        match Provider::from_byte(byte) {
+            Some(Provider::Apns) => Ok(Self::Apns(ApnsAddress::decode(body)?)),
+            None => Err(anyhow!("unknown push provider {byte}")),
         }
     }
 }

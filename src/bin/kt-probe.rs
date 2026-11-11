@@ -38,7 +38,7 @@ use keeptalking_sfu::{
     wake::{
         Kind, MAX_WAKE_FRAME_LEN, WAKE_ALPN, WakeRequest, WakeResponse,
         apns::{ApnsAddress, Environment},
-        handle::{Address, Purpose},
+        handle::{Address, Provider, Purpose},
     },
 };
 use n0_future::StreamExt;
@@ -199,6 +199,7 @@ async fn wake(args: WakeArgs) -> Result<()> {
 
     let outcome = match ask(WakeRequest::Send {
         kind: Kind::Context,
+        provider: Provider::Apns,
         handle: minted.handle,
         payload: br#"{"ciphertext":"kt-probe"}"#.as_slice().into(),
     })
